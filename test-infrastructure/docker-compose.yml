@@ -33,3 +33,48 @@ services:
     command: >
       sh -c "pip install -q asyncua cryptography 2>/dev/null && python server.py"
     restart: unless-stopped
+
+  # LibUA server under test — foreign clients connect to this
+  libua-server:
+    build:
+      context: ../
+      dockerfile: test-infrastructure/libua-server/Dockerfile
+    container_name: opcua-libua-server
+    ports:
+      - "7718:7718"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/7718' || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  # Foreign client test: python-asyncua client → LibUA server
+  test-python-client:
+    image: python:3.12-slim
+    container_name: test-python-client
+    depends_on:
+      libua-server:
+        condition: service_healthy
+    working_dir: /app
+    volumes:
+      - ./foreign-client-tests:/app:ro
+    command: >
+      sh -c "pip install -q asyncua 2>/dev/null && python test_python_client.py"
+    profiles:
+      - test
+
+  # Foreign client test: node-opcua client → LibUA server
+  test-node-client:
+    image: node:20-slim
+    container_name: test-node-client
+    depends_on:
+      libua-server:
+        condition: service_healthy
+    working_dir: /app
+    volumes:
+      - ./foreign-client-tests:/app
+    command: >
+      sh -c "npm install 2>&1 | tail -1 && node test_node_client.js"
+    profiles:
+      - test

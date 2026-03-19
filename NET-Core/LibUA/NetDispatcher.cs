@@ -668,9 +668,22 @@ namespace LibUA
                 reqHeader.SecurityRequestID = securityReqId;
                 reqHeader.SecuritySequenceNum = securitySeqNum;
 
+                // OPC UA Part 4: FindServers, GetEndpoints, CreateSession, ActivateSession, CloseSession
+                // and CloseSecureChannel do not require a valid authentication token
+                bool isSessionFreeService = typeId.NumericIdentifier switch
+                {
+                    (uint)RequestCode.FindServersRequest => true,
+                    (uint)RequestCode.GetEndpointsRequest => true,
+                    (uint)RequestCode.CreateSessionRequest => true,
+                    (uint)RequestCode.ActivateSessionRequest => true,
+                    (uint)RequestCode.CloseSessionRequest => true,
+                    (uint)RequestCode.CloseSecureChannelRequest => true,
+                    _ => false
+                };
+
                 if (config.AuthToken != null
                     && !reqHeader.AuthToken.Equals(config.AuthToken)
-                    && typeId.NumericIdentifier != (uint)RequestCode.CloseSecureChannelRequest)
+                    && !isSessionFreeService)
                 {
                     logger?.Log(LogLevel.Error, "{LoggerID}: Bad auth token {headerAuthToken}, expected {authToken}", LoggerID(), reqHeader.AuthToken, config.AuthToken);
 

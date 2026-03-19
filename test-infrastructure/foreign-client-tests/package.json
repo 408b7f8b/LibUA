@@ -1,0 +1,11 @@
+{
+  "name": "libua-foreign-client-tests",
+  "version": "1.0.0",
+  "description": "Foreign OPC UA client tests against LibUA server",
+  "scripts": {
+    "test": "node test_node_client.js"
+  },
+  "dependencies": {
+    "node-opcua-client": "^2.131.0"
+  }
+}

@@ -585,13 +585,28 @@ namespace TestServer
 
             sw.Stop();
             logger.Log(LogLevel.Information, "Created and started server in {elapsedTime:N3} ms", sw.ElapsedMilliseconds);
-            logger.Log(LogLevel.Information, "{protocol}://{listenAddress}:{listenPort}", "opc.tcp", "localhost", 7718);
+            logger.Log(LogLevel.Information, "{protocol}://{listenAddress}:{listenPort}", "opc.tcp", "0.0.0.0", 7718);
 
             var timer = new Timer(1000);
             timer.Elapsed += (sender, e) => { app.PlayRow(); };
 
             timer.Start();
-            Console.ReadKey();
+
+            // Support both interactive (Console.ReadKey) and Docker (SIGTERM) shutdown
+            var exitEvent = new System.Threading.ManualResetEventSlim(false);
+            Console.CancelKeyPress += (_, e) => { e.Cancel = true; exitEvent.Set(); };
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => exitEvent.Set();
+
+            if (Console.IsInputRedirected)
+            {
+                // Docker/non-interactive: wait for signal
+                exitEvent.Wait();
+            }
+            else
+            {
+                Console.ReadKey();
+            }
+
             timer.Stop();
 
             server.Stop();
