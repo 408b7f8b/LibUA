@@ -25,3 +25,9 @@ packages
 
 # Rider cache/options directory
 .idea/
+
+# Node.js
+node_modules/
+
+# Test infrastructure generated files
+test-infrastructure/node-opcua-server/certificates/
