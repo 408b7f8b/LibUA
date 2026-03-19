@@ -435,7 +435,7 @@ namespace LibUA
                         cont.Offset = i;
                         cont.IsValid = true;
 
-                        // TODO: Set continuation point
+                        // Continuation state stored in cont.Offset — will be used by BrowseNext
                         return StatusCode.GoodMoreData;
                     }
 

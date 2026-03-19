@@ -30,12 +30,21 @@ namespace LibUA
 
             protected override bool NeedsPulse()
             {
-                if (pendingNotificationRequests.Count == 0)
+                if (config == null || config.SLState != ConnectionState.Established)
                 {
                     return false;
                 }
 
-                if (config == null || config.SLState != ConnectionState.Established)
+                // Check session timeout
+                if (config.SessionTimeout > 0 && config.LastActivityTime != default &&
+                    DateTime.UtcNow - config.LastActivityTime > TimeSpan.FromMilliseconds(config.SessionTimeout))
+                {
+                    logger?.Log(LogLevel.Information, "{LoggerID}: Session timed out after {timeout}ms of inactivity", LoggerID(), config.SessionTimeout);
+                    config.SLState = ConnectionState.Closed;
+                    return false;
+                }
+
+                if (pendingNotificationRequests.Count == 0)
                 {
                     return false;
                 }
@@ -609,11 +618,13 @@ namespace LibUA
 
             protected int DispatchMessage(SLChannel config, MemoryBuffer recvBuf)
             {
+                config.LastActivityTime = DateTime.UtcNow;
+
+                // After chunk reassembly in Consume(), the buffer always starts with 'F'
                 if (recvBuf.Buffer[recvBuf.Position] != 'F')
                 {
-                    // Chunk reassembly not yet implemented — reject non-final chunks
-                    logger?.Log(LogLevel.Warning, "{LoggerID}: Received non-final chunk type '{chunkType}', chunk reassembly not supported", LoggerID(), (char)recvBuf.Buffer[recvBuf.Position]);
-                    UAStatusCode = (uint)StatusCode.BadRequestTooLarge;
+                    logger?.Log(LogLevel.Error, "{LoggerID}: Expected final chunk type 'F' but got '{chunkType}' — message reassembly failed", LoggerID(), (char)recvBuf.Buffer[recvBuf.Position]);
+                    UAStatusCode = (uint)StatusCode.BadDecodingError;
                     return ErrorInternal;
                 }
 
@@ -997,6 +1008,7 @@ namespace LibUA
                 if (!recvBuf.DecodeUAByteString(out byte[] clientNonce)) { return ErrorParseFail; }
                 if (!recvBuf.DecodeUAByteString(out byte[] clientCertificate)) { return ErrorParseFail; }
                 if (!recvBuf.Decode(out double requestedSessionTimeOut)) { return ErrorParseFail; }
+                config.SessionTimeout = (uint)Math.Max(1000, Math.Min(requestedSessionTimeOut, 3600000));
 
                 if (!recvBuf.Decode(out uint _)) { return ErrorParseFail; }
 
@@ -3126,17 +3138,34 @@ namespace LibUA
 
             protected int DispatchMessage_TransferSubscriptionsRequest(SLChannel config, RequestHeader reqHeader, MemoryBuffer recvBuf, uint messageSize)
             {
+                if (!recvBuf.Decode(out uint NoOfSubscriptionIds)) { return ErrorParseFail; }
+                if (!recvBuf.Decode(out bool sendInitialValues)) { return ErrorParseFail; }
+
+                var subIds = new uint[NoOfSubscriptionIds];
+                for (uint i = 0; i < NoOfSubscriptionIds; i++)
+                {
+                    if (!recvBuf.Decode(out subIds[i])) { return ErrorParseFail; }
+                }
+
                 using var respBuf = new MemoryBuffer(maximumMessageSize);
                 bool succeeded = DispatchMessage_WriteHeader(config, respBuf,
-                    (uint)RequestCode.TransferSubscriptionsResponse, reqHeader, (uint)StatusCode.BadNotSupported);
+                    (uint)RequestCode.TransferSubscriptionsResponse, reqHeader, (uint)StatusCode.Good);
 
                 if (!succeeded)
                 {
                     return ErrorRespWrite;
                 }
 
-                // Results
-                succeeded &= respBuf.Encode((UInt32)0);
+                // Results — one per subscription, all BadNotSupported
+                succeeded &= respBuf.Encode((UInt32)NoOfSubscriptionIds);
+                for (uint i = 0; i < NoOfSubscriptionIds; i++)
+                {
+                    // TransferResult: StatusCode
+                    succeeded &= respBuf.Encode((UInt32)StatusCode.BadNotSupported);
+                    // TransferResult: AvailableSequenceNumbers (empty array)
+                    succeeded &= respBuf.Encode((UInt32)0);
+                }
+
                 // DiagnosticInfos
                 succeeded &= respBuf.Encode((UInt32)0);
 
@@ -3442,28 +3471,35 @@ namespace LibUA
 
             protected int DispatchMessage_RepublishRequest(SLChannel config, RequestHeader reqHeader, MemoryBuffer recvBuf, uint messageSize)
             {
-                //UInt32 SubscriptionId, TimestampsToReturnUint, NoOfItemsToCreate;
-                //TimestampsToReturn timestampsToReturn;
+                if (!recvBuf.Decode(out uint subscriptionId)) { return ErrorParseFail; }
+                if (!recvBuf.Decode(out uint retransmitSequenceNumber)) { return ErrorParseFail; }
 
-                //if (!recvBuf.Decode(out SubscriptionId)) { return ErrorParseFail; }
-                //if (!recvBuf.Decode(out TimestampsToReturnUint)) { return ErrorParseFail; }
+                // Check if subscription exists
+                StatusCode serviceResult;
+                if (!subscriptionMap.TryGetValue(subscriptionId, out _))
+                {
+                    serviceResult = StatusCode.BadSubscriptionIdInvalid;
+                }
+                else
+                {
+                    // Notification retransmission queue not implemented — message not available
+                    serviceResult = StatusCode.BadMessageNotAvailable;
+                }
 
                 using var respBuf = new MemoryBuffer(maximumMessageSize);
                 bool succeeded = DispatchMessage_WriteHeader(config, respBuf,
-                    (uint)RequestCode.RepublishResponse, reqHeader, (uint)StatusCode.BadNotSupported);
+                    (uint)RequestCode.RepublishResponse, reqHeader, (uint)serviceResult);
 
                 if (!succeeded)
                 {
                     return ErrorRespWrite;
                 }
 
-                // Sequence
+                // NotificationMessage: SequenceNumber
                 succeeded &= respBuf.Encode((UInt32)0);
-
-                // PublishTime
+                // NotificationMessage: PublishTime
                 succeeded &= respBuf.Encode((Int64)0);
-
-                // NoOfNotificationData
+                // NotificationMessage: NoOfNotificationData
                 succeeded &= respBuf.Encode((Int32)0);
 
                 if (!succeeded)

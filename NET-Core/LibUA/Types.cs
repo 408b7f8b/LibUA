@@ -7104,6 +7104,7 @@ namespace LibUA
             public uint TokenID { get; set; }
             public uint TokenLifetime { get; set; }
             public uint SessionTimeout { get; set; }
+            public DateTime LastActivityTime { get; set; }
             public DateTimeOffset TokenCreatedAt { get; set; }
 
             public uint? PrevChannelID { get; set; }
