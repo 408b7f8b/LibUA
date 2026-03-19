@@ -144,7 +144,7 @@ namespace LibUA
 
                     listenerAccepted.Set();
                 }
-                catch
+                catch (Exception ex) when (ex is SocketException or ObjectDisposedException)
                 {
                     // Listener closed
 
@@ -419,7 +419,11 @@ namespace LibUA
                     {
                         bytesRead = socket.Receive(recvBuffer, recvAccumSize, bytesAvailable, SocketFlags.None);
                     }
-                    catch
+                    catch (SocketException)
+                    {
+                        break;
+                    }
+                    catch (ObjectDisposedException)
                     {
                         break;
                     }
@@ -451,7 +455,7 @@ namespace LibUA
                             if (UAStatusCode == (uint)StatusCode.Good) { UAStatusCode = (uint)StatusCode.BadNotImplemented; }
                             consumedSize = ErrorInternal;
                         }
-                        catch
+                        catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
                         {
                             consumedSize = ErrorInternal;
                         }

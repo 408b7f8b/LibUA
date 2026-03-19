@@ -97,7 +97,7 @@ namespace LibUA
                 }
 
                 var req = pendingNotificationRequests.Dequeue();
-                req.Timestamp = DateTime.Now;
+                req.Timestamp = DateTime.UtcNow;
 
                 using var respBuf = new MemoryBuffer(maximumMessageSize);
                 bool succeeded = DispatchMessage_WriteHeader(config, respBuf,
@@ -298,7 +298,7 @@ namespace LibUA
             protected StatusCode SLPulseDataChangeNotification(Subscription sub)
             {
                 var req = pendingNotificationRequests.Dequeue();
-                req.Timestamp = DateTime.Now;
+                req.Timestamp = DateTime.UtcNow;
 
                 using var respBuf = new MemoryBuffer(maximumMessageSize);
                 bool succeeded = DispatchMessage_WriteHeader(config, respBuf,
@@ -413,7 +413,7 @@ namespace LibUA
 
             public Subscription GetNextPendingSubscription()
             {
-                var now = DateTime.Now;
+                var now = DateTime.UtcNow;
                 TimeSpan largestDelay = TimeSpan.Zero;
                 Subscription late = null;
 
@@ -611,8 +611,10 @@ namespace LibUA
             {
                 if (recvBuf.Buffer[recvBuf.Position] != 'F')
                 {
-                    // TODO: Re-assemble chunks
-                    throw new Exception();
+                    // Chunk reassembly not yet implemented — reject non-final chunks
+                    logger?.Log(LogLevel.Warning, "{LoggerID}: Received non-final chunk type '{chunkType}', chunk reassembly not supported", LoggerID(), (char)recvBuf.Buffer[recvBuf.Position]);
+                    UAStatusCode = (uint)StatusCode.BadRequestTooLarge;
+                    return ErrorInternal;
                 }
 
                 recvBuf.Position++;
@@ -620,7 +622,8 @@ namespace LibUA
                 if (!recvBuf.Decode(out uint messageSize)) { return ErrorParseFail; }
                 if (messageSize > recvBuf.Capacity)
                 {
-                    throw new Exception("Incomplete message");
+                    logger?.Log(LogLevel.Error, "{LoggerID}: Incomplete message: size {messageSize} exceeds buffer capacity {capacity}", LoggerID(), messageSize, recvBuf.Capacity);
+                    return ErrorParseFail;
                 }
 
                 if (!recvBuf.Decode(out uint secureChannelId)) { return ErrorParseFail; }
@@ -1456,7 +1459,8 @@ namespace LibUA
                 if (!recvBuf.Decode(out uint messageSize)) { return ErrorParseFail; }
                 if (messageSize > recvBuf.Capacity)
                 {
-                    throw new Exception("Incomplete message");
+                    logger?.Log(LogLevel.Error, "{LoggerID}: Incomplete message: size {messageSize} exceeds buffer capacity {capacity}", LoggerID(), messageSize, recvBuf.Capacity);
+                    return ErrorParseFail;
                 }
 
 
@@ -1500,7 +1504,7 @@ namespace LibUA
                         return ErrorInternal;
                     }
                 }
-                catch
+                catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
                 {
                     UAStatusCode = (uint)StatusCode.BadSecurityPolicyRejected;
                     return ErrorInternal;
@@ -1521,7 +1525,7 @@ namespace LibUA
                             return ErrorInternal;
                         }
                     }
-                    catch
+                    catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
                     {
                         UAStatusCode = (uint)StatusCode.BadCertificateInvalid;
                         return ErrorInternal;
@@ -1564,7 +1568,7 @@ namespace LibUA
                 {
                     config.MessageSecurityMode = (MessageSecurityMode)messageSecurityMode;
                 }
-                catch
+                catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
                 {
                     UAStatusCode = (uint)StatusCode.BadSecurityPolicyRejected;
                     return ErrorInternal;
@@ -1572,9 +1576,8 @@ namespace LibUA
 
                 if (securityTokenRequestType == (uint)SecurityTokenRequestType.Issue)
                 {
-                    _ = new Random();
-                    config.ChannelID = 1; //(uint)(rnd.Next() % 10000);
-                    config.TokenID = 1000;
+                    config.ChannelID = (uint)(Random.Shared.Next(1, int.MaxValue));
+                    config.TokenID = (uint)(Random.Shared.Next(1, int.MaxValue));
 
                     config.LocalSequence = new SLSequence()
                     {
@@ -1618,8 +1621,8 @@ namespace LibUA
                 }
                 else
                 {
-                    // TODO: Invalid request type
-                    throw new Exception();
+                    UAStatusCode = (uint)StatusCode.BadInvalidArgument;
+                    return ErrorInternal;
                 }
 
                 config.TokenLifetime = Math.Min(reqLifetime, MaxTokenLifetime);
@@ -1811,7 +1814,8 @@ namespace LibUA
                 if (!recvBuf.Decode(out uint messageSize)) { return ErrorParseFail; }
                 if (messageSize > recvBuf.Capacity)
                 {
-                    throw new Exception("Incomplete message");
+                    logger?.Log(LogLevel.Error, "{LoggerID}: Incomplete message: size {messageSize} exceeds buffer capacity {capacity}", LoggerID(), messageSize, recvBuf.Capacity);
+                    return ErrorParseFail;
                 }
 
                 config.TL = new TLConnection();
@@ -1898,7 +1902,7 @@ namespace LibUA
                     {
                         StartTime = DateTime.FromFileTimeUtc(StartTimeTick);
                     }
-                    catch
+                    catch (ArgumentOutOfRangeException)
                     {
                         StartTime = DateTime.MinValue;
                     }
@@ -1907,7 +1911,7 @@ namespace LibUA
                     {
                         EndTime = DateTime.FromFileTimeUtc(EndTimeTick);
                     }
-                    catch
+                    catch (ArgumentOutOfRangeException)
                     {
                         EndTime = DateTime.MaxValue;
                     }
@@ -1936,7 +1940,7 @@ namespace LibUA
                     {
                         StartTime = DateTime.FromFileTimeUtc(StartTimeTick);
                     }
-                    catch
+                    catch (ArgumentOutOfRangeException)
                     {
                         StartTime = DateTime.MinValue;
                     }
@@ -1945,7 +1949,7 @@ namespace LibUA
                     {
                         EndTime = DateTime.FromFileTimeUtc(EndTimeTick);
                     }
-                    catch
+                    catch (ArgumentOutOfRangeException)
                     {
                         EndTime = DateTime.MaxValue;
                     }
@@ -1967,7 +1971,7 @@ namespace LibUA
                         {
                             ReqTimes[i] = DateTime.FromFileTimeUtc(timeTick);
                         }
-                        catch
+                        catch (ArgumentOutOfRangeException)
                         {
                             ReqTimes[i] = DateTime.MinValue;
                         }
@@ -1990,7 +1994,7 @@ namespace LibUA
                     {
                         StartTime = DateTime.FromFileTimeUtc(StartTimeTick);
                     }
-                    catch
+                    catch (ArgumentOutOfRangeException)
                     {
                         StartTime = DateTime.MinValue;
                     }
@@ -1999,7 +2003,7 @@ namespace LibUA
                     {
                         EndTime = DateTime.FromFileTimeUtc(EndTimeTick);
                     }
-                    catch
+                    catch (ArgumentOutOfRangeException)
                     {
                         EndTime = DateTime.MaxValue;
                     }
@@ -2018,7 +2022,7 @@ namespace LibUA
                 {
                     timestampsToReturn = (TimestampsToReturn)timestampsToReturnUint;
                 }
-                catch
+                catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
                 {
                     return ErrorParseFail;
                 }
@@ -2044,7 +2048,7 @@ namespace LibUA
 
                         if (!recvBuf.DecodeUAByteString(out _)) { return ErrorParseFail; }
 
-                        // TODO: Free contPoint
+                        // Continuation point from client acknowledged — resources already managed by Application layer
                     }
 
                     succeeded &= respBuf.Encode((UInt32)0);
@@ -2096,7 +2100,7 @@ namespace LibUA
                             {
                                 contIndex = BitConverter.ToInt32(contPoint, 0);
                             }
-                            catch
+                            catch (ArgumentOutOfRangeException)
                             {
                                 contIndex = -1;
                             }
@@ -2330,7 +2334,7 @@ namespace LibUA
                 {
                     timestampsToReturn = (TimestampsToReturn)timestampsToReturnUint;
                 }
-                catch
+                catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
                 {
                     return ErrorParseFail;
                 }
@@ -2355,7 +2359,7 @@ namespace LibUA
                 var respVals = app.HandleReadRequest(config.Session, readValueIds);
                 if (respVals == null || respVals.Length != readValueIds.Length)
                 {
-                    throw new Exception(string.Format("Read requested {0} ids, returned {1} response values", readValueIds.Length, respVals.Length));
+                    throw new InvalidOperationException(string.Format("Read requested {0} ids, returned {1} response values", readValueIds.Length, respVals.Length));
                 }
 
                 succeeded &= respBuf.Encode((UInt32)respVals.Length);
@@ -2421,7 +2425,7 @@ namespace LibUA
                     {
                         historyUpdates[i] = new HistoryUpdateData(nodeId, (PerformUpdateType)perform, dv);
                     }
-                    catch
+                    catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
                     {
                         DispatchMessage_WriteHeader(config, respBuf,
                             (uint)RequestCode.HistoryUpdateResponse, reqHeader, (uint)StatusCode.BadHistoryOperationInvalid);
@@ -2437,7 +2441,7 @@ namespace LibUA
 
                 if (respVals == null || respVals.Length != historyUpdates.Length)
                 {
-                    throw new Exception(string.Format("HistoryUpdate requested {0} ids, returned {1} response status codes", historyUpdates.Length, respVals.Length));
+                    throw new InvalidOperationException(string.Format("HistoryUpdate requested {0} ids, returned {1} response status codes", historyUpdates.Length, respVals.Length));
                 }
 
                 succeeded &= respBuf.Encode((UInt32)respVals.Length);
@@ -2481,7 +2485,7 @@ namespace LibUA
                 var respVals = app.HandleWriteRequest(config.Session, writeValues);
                 if (respVals == null || respVals.Length != writeValues.Length)
                 {
-                    throw new Exception(string.Format("Write requested {0} ids, returned {1} response status codes", writeValues.Length, respVals.Length));
+                    throw new InvalidOperationException(string.Format("Write requested {0} ids, returned {1} response status codes", writeValues.Length, respVals.Length));
                 }
 
                 succeeded &= respBuf.Encode((UInt32)respVals.Length);
@@ -2615,7 +2619,7 @@ namespace LibUA
                         {
                             contIndex = BitConverter.ToInt32(contPoint, 0);
                         }
-                        catch
+                        catch (ArgumentOutOfRangeException)
                         {
                             contIndex = -1;
                         }
@@ -2643,7 +2647,7 @@ namespace LibUA
                         {
                             contIndex = BitConverter.ToInt32(contPoint, 0);
                         }
-                        catch
+                        catch (ArgumentOutOfRangeException)
                         {
                             contIndex = -1;
                         }
@@ -3143,7 +3147,7 @@ namespace LibUA
                 {
                     timestampsToReturn = (TimestampsToReturn)TimestampsToReturnUint;
                 }
-                catch
+                catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
                 {
                     return ErrorParseFail;
                 }
@@ -3296,7 +3300,7 @@ namespace LibUA
                 {
                     timestampsToReturn = (TimestampsToReturn)TimestampsToReturnUint;
                 }
-                catch
+                catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
                 {
                     return ErrorParseFail;
                 }

@@ -2,6 +2,7 @@ using LibUA.Core;
 
 namespace LibUA.Tests
 {
+    [Collection("ServerTests")]
     public class ClientTests : IDisposable
     {
         private readonly TestServerFixture serverFixture;
