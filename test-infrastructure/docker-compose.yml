@@ -60,7 +60,7 @@ services:
     volumes:
       - ./foreign-client-tests:/app:ro
     command: >
-      sh -c "pip install -q asyncua 2>/dev/null && python test_python_client.py"
+      sh -c "pip install -q asyncua cryptography 2>/dev/null && python test_python_client.py"
     profiles:
       - test
 

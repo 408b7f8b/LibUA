@@ -7,6 +7,7 @@ Tests OPC UA interoperability from an independent client implementation.
 import asyncio
 import sys
 import time
+from datetime import datetime, timezone
 
 RESULTS = []
 SERVER_URL = "opc.tcp://libua-server:7718"
@@ -176,6 +177,168 @@ async def run_tests():
                    f"registered={len(registered)}")
     except Exception as e:
         report("T12 RegisterNodes + Unregister", False, str(e))
+
+    # T13: Encrypted Channel (Basic256Sha256 SignAndEncrypt)
+    try:
+        from asyncua.crypto.cert_gen import setup_self_signed_certificate
+        from cryptography.x509.oid import ExtendedKeyUsageOID
+        from pathlib import Path
+        import tempfile
+
+        tmpdir = tempfile.mkdtemp()
+        cert_file = Path(tmpdir) / "cert.der"
+        key_file = Path(tmpdir) / "key.pem"
+
+        await setup_self_signed_certificate(
+            key_file,
+            cert_file,
+            "urn:asyncua:testclient",
+            "localhost",
+            cert_use=[ExtendedKeyUsageOID.CLIENT_AUTH],
+            subject_attrs={"organizationName": "Test"},
+        )
+
+        client = Client(url=SERVER_URL, timeout=15)
+        client.application_uri = "urn:asyncua:testclient"
+        security_string = f"Basic256Sha256,SignAndEncrypt,{cert_file},{key_file}"
+        await client.set_security_string(security_string)
+        await client.connect()
+        try:
+            node = client.get_node(ua.NodeId(1, 2))
+            value = await node.read_value()
+            ok = isinstance(value, (int, float)) and abs(value - 3.14159265) < 1.0
+            report("T13 Encrypted Channel (B256S256)", ok,
+                   f"value={value}")
+        finally:
+            await client.disconnect()
+    except Exception as e:
+        report("T13 Encrypted Channel (B256S256)", False, str(e))
+
+    # T14: Username Authentication
+    try:
+        client = Client(url=SERVER_URL, timeout=10)
+        client.set_user("testuser")
+        client.set_password("testpass")
+        await client.connect()
+        try:
+            node = client.get_node(ua.NodeId(1, 2))
+            value = await node.read_value()
+            ok = isinstance(value, (int, float)) and abs(value - 3.14159265) < 1.0
+            report("T14 Username Authentication", ok,
+                   f"value={value}")
+        finally:
+            await client.disconnect()
+    except Exception as e:
+        report("T14 Username Authentication", False, str(e))
+
+    # T15: Read Node Attributes (DisplayName, BrowseName)
+    try:
+        async with Client(url=SERVER_URL, timeout=10) as client:
+            node = client.get_node(ua.NodeId(1, 2))
+            display_name = await node.read_display_name()
+            browse_name = await node.read_browse_name()
+            ok = display_name is not None and browse_name is not None
+            report("T15 Read Node Attributes", ok,
+                   f"DisplayName={display_name}, BrowseName={browse_name}")
+    except Exception as e:
+        report("T15 Read Node Attributes", False, str(e))
+
+    # T16: Multiple Subscriptions
+    try:
+        async with Client(url=SERVER_URL, timeout=15) as client:
+            received1 = []
+            received2 = []
+
+            class Handler1:
+                def datachange_notification(self, node, val, data):
+                    received1.append(val)
+
+            class Handler2:
+                def datachange_notification(self, node, val, data):
+                    received2.append(val)
+
+            sub1 = await client.create_subscription(200, Handler1())
+            sub2 = await client.create_subscription(200, Handler2())
+            node1 = client.get_node(ua.NodeId(1, 2))
+            node2 = client.get_node(ua.NodeId(2, 2))
+            handle1 = await sub1.subscribe_data_change(node1)
+            handle2 = await sub2.subscribe_data_change(node2)
+            await asyncio.sleep(3)
+            await sub1.unsubscribe(handle1)
+            await sub2.unsubscribe(handle2)
+            await sub1.delete()
+            await sub2.delete()
+            ok = len(received1) > 0 and len(received2) > 0
+            report("T16 Multiple Subscriptions", ok,
+                   f"sub1={len(received1)} notifs, sub2={len(received2)} notifs")
+    except Exception as e:
+        report("T16 Multiple Subscriptions", False, str(e))
+
+    # T17: History Read
+    try:
+        async with Client(url=SERVER_URL, timeout=10) as client:
+            node = client.get_node(ua.NodeId(1, 2))
+            start = datetime(2015, 12, 1, tzinfo=timezone.utc)
+            end = datetime(2015, 12, 2, tzinfo=timezone.utc)
+            history = await node.read_raw_history(starttime=start, endtime=end)
+            ok = history is not None and len(history) > 0
+            report("T17 History Read", ok,
+                   f"{len(history)} data values returned")
+    except Exception as e:
+        report("T17 History Read", False, str(e))
+
+    # T18: Read 2D Array
+    try:
+        async with Client(url=SERVER_URL, timeout=10) as client:
+            node = client.get_node(ua.NodeId(1002, 2))
+            value = await node.read_value()
+            # 2D array may come as flat list or nested list
+            ok = value is not None and hasattr(value, '__len__') and len(value) > 0
+            report("T18 Read 2D Array", ok,
+                   f"value type={type(value).__name__}, len={len(value) if hasattr(value, '__len__') else 'N/A'}")
+    except Exception as e:
+        report("T18 Read 2D Array", False, str(e))
+
+    # T19: Concurrent Reads (asyncio.gather)
+    try:
+        async with Client(url=SERVER_URL, timeout=10) as client:
+            async def read_node(node_id):
+                node = client.get_node(ua.NodeId(node_id, 2))
+                return await node.read_value()
+
+            tasks = [read_node(i) for i in range(1, 11)]
+            values = await asyncio.gather(*tasks)
+            ok = len(values) == 10 and all(v is not None for v in values)
+            report("T19 Concurrent Reads", ok,
+                   f"{len(values)} values, all valid={ok}")
+    except Exception as e:
+        report("T19 Concurrent Reads", False, str(e))
+
+    # T20: Subscription Modify + Delete
+    try:
+        async with Client(url=SERVER_URL, timeout=10) as client:
+            class DummyHandler:
+                def datachange_notification(self, node, val, data):
+                    pass
+
+            sub = await client.create_subscription(500, DummyHandler())
+            node = client.get_node(ua.NodeId(1, 2))
+            handle = await sub.subscribe_data_change(node)
+            # Modify publishing interval via low-level uaclient API
+            mod_params = ua.ModifySubscriptionParameters()
+            mod_params.SubscriptionId = sub.subscription_id
+            mod_params.RequestedPublishingInterval = 1000
+            mod_params.RequestedMaxKeepAliveCount = 10
+            mod_params.RequestedLifetimeCount = 300
+            mod_params.MaxNotificationsPerPublish = 0
+            result = await client.uaclient.modify_subscription(mod_params)
+            ok = result.RevisedPublishingInterval is not None
+            await sub.unsubscribe(handle)
+            await sub.delete()
+            report("T20 Subscription Modify + Delete", ok,
+                   f"revised interval={result.RevisedPublishingInterval}")
+    except Exception as e:
+        report("T20 Subscription Modify + Delete", False, str(e))
 
 
 async def main():
