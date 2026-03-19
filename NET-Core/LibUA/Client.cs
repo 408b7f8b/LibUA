@@ -110,6 +110,20 @@ namespace LibUA
         public UASecurity.CertificateValidationOptions CertificateValidation { get; set; }
 
         /// <summary>
+        /// Send buffer size proposed in the Hello message. Some PLCs (e.g., Siemens S7-1500)
+        /// require 8192 and reject the default 65536. Set before calling Connect().
+        /// Default: 65536.
+        /// </summary>
+        public uint HelloSendBufferSize { get; set; } = 1 << 16;
+
+        /// <summary>
+        /// Receive buffer size proposed in the Hello message. Some PLCs (e.g., Siemens S7-1500)
+        /// require 8192 and reject the default 65536. Set before calling Connect().
+        /// Default: 65536.
+        /// </summary>
+        public uint HelloRecvBufferSize { get; set; } = 1 << 16;
+
+        /// <summary>
         /// Registry for custom DataType definitions. Populated by LoadDataTypeDefinition() or LoadDataTypesForNamespace().
         /// Used to automatically decode ExtensionObjects with custom structured types.
         /// </summary>
@@ -994,8 +1008,8 @@ namespace LibUA
                 TransportConfig = new TLConfiguration()
                 {
                     ProtocolVersion = 0,
-                    SendBufferSize = 1 << 16,
-                    RecvBufferSize = 1 << 16,
+                    SendBufferSize = HelloSendBufferSize,
+                    RecvBufferSize = HelloRecvBufferSize,
                     MaxMessageSize = (uint)MaximumMessageSize,
                     MaxChunkCount = 0, // 0 = no limit per OPC UA Part 6
                 }
