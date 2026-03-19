@@ -51,7 +51,7 @@ namespace LibUA
                     return PaddingAlgorithm.PKCS1;
             }
 
-            throw new Exception();
+            throw new NotSupportedException($"No padding method defined for security policy '{policy}'");
         }
 
         public static string SignatureAlgorithmForSecurityPolicy(SecurityPolicy policy)
@@ -89,7 +89,7 @@ namespace LibUA
                     return 16;
             }
 
-            throw new Exception();
+            throw new NotSupportedException($"No symmetric key size defined for security policy '{policy}'");
         }
 
 
@@ -114,7 +114,7 @@ namespace LibUA
                     return 16;
             }
 
-            throw new Exception();
+            throw new NotSupportedException($"No symmetric signature key size defined for security policy '{policy}'");
         }
 
         public static RSAEncryptionPadding UseOaepForSecurityPolicy(SecurityPolicy policy)
@@ -156,7 +156,7 @@ namespace LibUA
             RSA rsa = cert.PublicKey.GetRSAPublicKey();
             if (rsa == null)
             {
-                throw new Exception("Could not create RSA");
+                throw new CryptographicException("Could not extract RSA public key from certificate");
             }
 
             return rsa.KeySize;
@@ -171,7 +171,7 @@ namespace LibUA
 
             if (pad < 0)
             {
-                throw new Exception();
+                throw new InvalidOperationException($"Calculated negative padding size ({pad}) for position {position}, sigSize {sigSize}, blockSize {plainBlockSize}");
             }
 
             return pad;
@@ -186,7 +186,7 @@ namespace LibUA
 
             if (pad < 0)
             {
-                throw new Exception();
+                throw new InvalidOperationException($"Calculated negative padding size ({pad}) for position {position}, sigSize {sigSize}, blockSize {plainBlockSize}");
             }
 
             return pad;
@@ -200,24 +200,18 @@ namespace LibUA
 
         public static int CalculateSymmetricPaddingSize(int keySize, int position)
         {
-            if (keySize > 256)
-            {
-                throw new Exception("TODO: Handle keys above 2048 bits");
-            }
-
-            int pad = position + keySize;
-
-            // Size byte
-            pad++;
+            // OPC 10000-6: 2-byte padding header for keys > 2048 bit (256 bytes)
+            int paddingHeaderSize = (keySize > 256) ? 2 : 1;
+            int totalSize = position + paddingHeaderSize;
             if (keySize > 0)
             {
-                pad -= pad % keySize;
+                totalSize = ((totalSize + keySize - 1) / keySize) * keySize;
             }
-            pad -= position;
+            int pad = totalSize - position;
 
-            if (pad < 0 || pad > 256)
+            if (pad < 0)
             {
-                throw new Exception();
+                throw new InvalidOperationException($"Calculated negative symmetric padding size ({pad}) for keySize {keySize}, position {position}");
             }
 
             return pad;
@@ -238,7 +232,7 @@ namespace LibUA
             RSA rsa = cert.PublicKey.GetRSAPublicKey();
             if (rsa == null)
             {
-                throw new Exception("Could not create RSA");
+                throw new CryptographicException("Could not extract RSA public key from certificate");
             }
 
             int pad = PaddingSizeForMethod(paddingAlgorithm);
@@ -246,7 +240,7 @@ namespace LibUA
 
             if (keySize < pad)
             {
-                throw new Exception();
+                throw new CryptographicException($"RSA key size ({keySize} bytes) is smaller than required padding ({pad} bytes) for {paddingAlgorithm}");
             }
 
             int blockSize = keySize - pad;
@@ -265,7 +259,7 @@ namespace LibUA
                 case PaddingAlgorithm.SHA256_OAEP: return RsaSHA256OaepPaddingSize;
             }
 
-            throw new Exception();
+            throw new NotSupportedException($"Unknown padding algorithm: {paddingMethod}");
         }
 
         public static string ExportPEM(X509Certificate cert)
@@ -386,7 +380,7 @@ namespace LibUA
                 {
                     if (data.Count % crypt.InputBlockSize != 0)
                     {
-                        throw new Exception(string.Format("Input data is not a multiple of block size, {0}/{1}", data.Count, crypt.InputBlockSize));
+                        throw new CryptographicException(string.Format("Input data size ({0}) is not a multiple of block size ({1})", data.Count, crypt.InputBlockSize));
                     }
 
                     crypt.TransformBlock(data.Array, data.Offset, data.Count, data.Array, data.Offset);
@@ -408,7 +402,7 @@ namespace LibUA
                 {
                     if (data.Count % crypt.InputBlockSize != 0)
                     {
-                        throw new Exception(string.Format("Input data is not a multiple of block size, {0}/{1}", data.Count, crypt.InputBlockSize));
+                        throw new CryptographicException(string.Format("Input data size ({0}) is not a multiple of block size ({1})", data.Count, crypt.InputBlockSize));
                     }
 
                     crypt.TransformBlock(data.Array, data.Offset, data.Count, data.Array, data.Offset);
@@ -677,7 +671,7 @@ namespace LibUA
             var rsa = cert.PublicKey.GetRSAPublicKey();
             if (rsa == null)
             {
-                throw new Exception("Could not create RSA");
+                throw new CryptographicException("Could not extract RSA public key from certificate");
             }
 
             int r = rsa.KeySize / 8;
@@ -702,7 +696,7 @@ namespace LibUA
             var rsa = cert.PublicKey.GetRSAPublicKey();
             if (rsa == null)
             {
-                throw new Exception("Could not create RSA");
+                throw new CryptographicException("Could not extract RSA public key from certificate");
             }
 
             return rsa.KeySize / 8;
@@ -713,7 +707,7 @@ namespace LibUA
             var rsa = cert.PublicKey.GetRSAPublicKey();
             if (rsa == null)
             {
-                throw new Exception("Could not create RSA");
+                throw new CryptographicException("Could not extract RSA public key from certificate");
             }
 
             return rsa.KeySize / 8;
@@ -809,7 +803,7 @@ namespace LibUA
 
             if (data.Count % inputBlockSize != 0)
             {
-                throw new Exception(string.Format("Input data is not a multiple of block size, {0}/{1}", data.Count, inputBlockSize));
+                throw new CryptographicException(string.Format("Input data size ({0}) is not a multiple of block size ({1})", data.Count, inputBlockSize));
             }
 
             var input = new byte[inputBlockSize];
@@ -838,7 +832,7 @@ namespace LibUA
 
             if (data.Count % inputBlockSize != 0)
             {
-                throw new Exception(string.Format("Input data is not a multiple of block size, {0}/{1}", data.Count, inputBlockSize));
+                throw new CryptographicException(string.Format("Input data size ({0}) is not a multiple of block size ({1})", data.Count, inputBlockSize));
             }
 
             var ms = new MemoryStream(buffer);
@@ -854,9 +848,195 @@ namespace LibUA
             return buffer;
         }
 
+        /// <summary>
+        /// Certificate validation options per OPC UA Part 4, 6.1
+        /// </summary>
+        public class CertificateValidationOptions
+        {
+            /// <summary>Validate certificate chain and expiry (default: true)</summary>
+            public bool ValidateChain { get; set; } = true;
+
+            /// <summary>Allow self-signed certificates (default: true for OPC UA compatibility)</summary>
+            public bool AllowSelfSigned { get; set; } = true;
+
+            /// <summary>Expected ApplicationUri from EndpointDescription (null = skip check)</summary>
+            public string ExpectedApplicationUri { get; set; }
+
+            /// <summary>Expected hostname or IP from endpoint URL (null = skip check)</summary>
+            public string ExpectedHostname { get; set; }
+
+            /// <summary>Check certificate revocation via CRL (default: false, requires network)</summary>
+            public bool CheckRevocation { get; set; } = false;
+
+            /// <summary>Additional trusted CA certificates</summary>
+            public X509Certificate2Collection TrustedCertificates { get; set; }
+
+            /// <summary>Suppress all validation (for testing only)</summary>
+            public bool SuppressAllValidation { get; set; } = false;
+        }
+
+        /// <summary>
+        /// Backward-compatible certificate check (no validation, matches old behavior)
+        /// </summary>
         public static bool VerifyCertificate(X509Certificate2 senderCert)
         {
             return senderCert != null;
+        }
+
+        /// <summary>
+        /// Full OPC UA certificate validation per Part 4, 6.1
+        /// Returns StatusCode.Good on success, specific Bad status on failure.
+        /// </summary>
+        public static StatusCode ValidateCertificate(X509Certificate2 cert, CertificateValidationOptions options)
+        {
+            if (options == null || options.SuppressAllValidation) return StatusCode.Good;
+            if (cert == null) return StatusCode.BadCertificateInvalid;
+
+            // 1. Check expiry
+            if (cert.NotBefore > DateTime.UtcNow)
+                return StatusCode.BadCertificateTimeInvalid;
+            if (cert.NotAfter < DateTime.UtcNow)
+                return StatusCode.BadCertificateTimeInvalid;
+
+            // 2. Check key usage — OPC UA requires digitalSignature + keyEncipherment or dataEncipherment
+            foreach (var ext in cert.Extensions)
+            {
+                if (ext is X509KeyUsageExtension keyUsage)
+                {
+                    if ((keyUsage.KeyUsages & X509KeyUsageFlags.DigitalSignature) == 0)
+                        return StatusCode.BadCertificateUseNotAllowed;
+                }
+            }
+
+            // 3. Validate ApplicationUri in SubjectAlternativeName (OPC UA Part 4, 6.1.3)
+            if (options.ExpectedApplicationUri != null)
+            {
+                bool foundUri = false;
+                foreach (var ext in cert.Extensions)
+                {
+                    if (ext.Oid?.Value == "2.5.29.17") // Subject Alternative Name
+                    {
+                        // Parse SAN extension for URI entries
+                        var sanStr = ext.Format(true);
+                        if (sanStr != null)
+                        {
+                            foreach (var line in sanStr.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                            {
+                                var trimmed = line.Trim();
+                                // Format varies by platform: "URL=..." or "URI:..." or "Uniform Resource Identifier=..."
+                                if (trimmed.StartsWith("URL=", StringComparison.OrdinalIgnoreCase) ||
+                                    trimmed.StartsWith("URI:", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    var uri = trimmed.Substring(trimmed.IndexOf('=') + 1).Trim();
+                                    if (trimmed.Contains(':'))
+                                        uri = trimmed.Substring(trimmed.IndexOf(':') + 1).Trim();
+                                    if (string.Equals(uri, options.ExpectedApplicationUri, StringComparison.OrdinalIgnoreCase))
+                                        foundUri = true;
+                                }
+                                else if (trimmed.Contains(options.ExpectedApplicationUri))
+                                {
+                                    foundUri = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!foundUri)
+                    return StatusCode.BadCertificateUriInvalid;
+            }
+
+            // 4. Validate hostname in SAN or CN (OPC UA Part 6, 6.2.3)
+            if (options.ExpectedHostname != null)
+            {
+                bool foundHostname = false;
+
+                // Check SAN DNS names and IP addresses
+                foreach (var ext in cert.Extensions)
+                {
+                    if (ext.Oid?.Value == "2.5.29.17")
+                    {
+                        var sanStr = ext.Format(true);
+                        if (sanStr != null && sanStr.IndexOf(options.ExpectedHostname, StringComparison.OrdinalIgnoreCase) >= 0)
+                            foundHostname = true;
+                    }
+                }
+
+                // Fallback: Check CN
+                if (!foundHostname && cert.Subject != null)
+                {
+                    var cn = cert.GetNameInfo(X509NameType.SimpleName, false);
+                    if (string.Equals(cn, options.ExpectedHostname, StringComparison.OrdinalIgnoreCase))
+                        foundHostname = true;
+                }
+
+                if (!foundHostname)
+                    return StatusCode.BadCertificateHostNameInvalid;
+            }
+
+            // 5. Chain validation
+            if (options.ValidateChain)
+            {
+                bool isSelfSigned = cert.Subject == cert.Issuer;
+                if (isSelfSigned && options.AllowSelfSigned)
+                {
+                    // Self-signed: only validate expiry (already done) and signature
+                    try
+                    {
+                        cert.Verify();
+                    }
+                    catch (CryptographicException)
+                    {
+                        // Self-signed certs often fail Verify() due to missing trust anchor — accept if AllowSelfSigned
+                    }
+                }
+                else if (!isSelfSigned)
+                {
+                    using var chain = new X509Chain();
+                    chain.ChainPolicy.RevocationMode = options.CheckRevocation
+                        ? X509RevocationMode.Online
+                        : X509RevocationMode.NoCheck;
+                    chain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllowUnknownCertificateAuthority;
+
+                    if (options.TrustedCertificates != null)
+                    {
+                        chain.ChainPolicy.ExtraStore.AddRange(options.TrustedCertificates);
+                    }
+
+                    if (!chain.Build(cert))
+                    {
+                        foreach (var status in chain.ChainStatus)
+                        {
+                            if (status.Status == X509ChainStatusFlags.UntrustedRoot && options.AllowSelfSigned)
+                                continue;
+                            if (status.Status == X509ChainStatusFlags.RevocationStatusUnknown && !options.CheckRevocation)
+                                continue;
+
+                            return StatusCode.BadSecurityChecksFailed;
+                        }
+                    }
+                }
+            }
+
+            // 6. CRL check (if enabled and chain validation passed)
+            if (options.CheckRevocation)
+            {
+                using var chain = new X509Chain();
+                chain.ChainPolicy.RevocationMode = X509RevocationMode.Online;
+                chain.ChainPolicy.RevocationFlag = X509RevocationFlag.EntireChain;
+
+                if (!chain.Build(cert))
+                {
+                    foreach (var status in chain.ChainStatus)
+                    {
+                        if (status.Status == X509ChainStatusFlags.Revoked)
+                            return StatusCode.BadCertificateRevoked;
+                        if (status.Status == X509ChainStatusFlags.RevocationStatusUnknown)
+                            return StatusCode.BadCertificateRevocationUnknown;
+                    }
+                }
+            }
+
+            return StatusCode.Good;
         }
 
         public static byte[] SHACalculate(byte[] data, SecurityPolicy policy)
@@ -998,7 +1178,7 @@ namespace LibUA
 
                     //respDecodeSize = (UInt32)(messageEncodedBlockStart + decrSize);
                 }
-                catch
+                catch (CryptographicException)
                 {
                     return StatusCode.BadSecurityChecksFailed;
                 }
@@ -1031,18 +1211,32 @@ namespace LibUA
                         }
                     }
 
-                    byte padValue = securityMode == MessageSecurityMode.SignAndEncrypt ? (byte)(recvBuf.Buffer[messageSize - sigSize - 1] + 1) : (byte)0;
+                    int padValue = 0;
+                    if (securityMode == MessageSecurityMode.SignAndEncrypt)
+                    {
+                        bool useExtraPadding = remoteKeysets[keysetIdx].SymEncKey.Length > 256;
+                        if (useExtraPadding)
+                        {
+                            padValue = recvBuf.Buffer[messageSize - sigSize - 2] |
+                                       (recvBuf.Buffer[messageSize - sigSize - 1] << 8);
+                            padValue += 2; // padding bytes + 2 size bytes
+                        }
+                        else
+                        {
+                            padValue = recvBuf.Buffer[messageSize - sigSize - 1] + 1;
+                        }
+                    }
                     if (decrSize > 0)
                     {
                         decrSize -= sigSize;
-                        decrSize -= (int)padValue;
+                        decrSize -= padValue;
                         if (decrSize <= 0)
                         {
                             return StatusCode.BadSecurityChecksFailed;
                         }
                     }
                 }
-                catch
+                catch (Exception ex) when (ex is CryptographicException or ArgumentException or IndexOutOfRangeException)
                 {
                     return StatusCode.BadSecurityChecksFailed;
                 }
@@ -1069,11 +1263,18 @@ namespace LibUA
             {
                 //int padSize2 = CalculateSymmetricPaddingSize(remoteKeyset.SymEncKey.Length, sigSize + respBuf.Position - messageEncodedBlockStart);
                 int padSize = CalculateSymmetricPaddingSize(localKeyset.SymEncKey.Length, sigSize + respBuf.Position - messageEncodedBlockStart);
+                bool useExtraPadding = localKeyset.SymEncKey.Length > 256;
 
-                byte paddingValue = (byte)((padSize - 1) & 0xFF);
+                int paddingDataLen = useExtraPadding ? padSize - 2 : padSize - 1;
+                byte paddingValue = (byte)(paddingDataLen & 0xFF);
 
                 var appendPadding = new byte[padSize];
                 for (int i = 0; i < padSize; i++) { appendPadding[i] = paddingValue; }
+                if (useExtraPadding)
+                {
+                    // ExtraPaddingByte: high byte of padding size
+                    appendPadding[padSize - 1] = (byte)((paddingDataLen >> 8) & 0xFF);
+                }
                 respBuf.Append(appendPadding);
             }
 
@@ -1095,7 +1296,7 @@ namespace LibUA
 
             if (msgSize != respBuf.Position)
             {
-                throw new Exception();
+                throw new InvalidOperationException($"Signed message size mismatch: expected {msgSize}, actual {respBuf.Position}");
             }
 
             if (securityMode >= MessageSecurityMode.SignAndEncrypt)

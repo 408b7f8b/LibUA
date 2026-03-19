@@ -1,0 +1,35 @@
+services:
+  open62541:
+    image: open62541/open62541:latest
+    container_name: opcua-open62541
+    ports:
+      - "4840:4840"
+    volumes:
+      - ./open62541-certs:/certs:ro
+    command: >
+      /opt/open62541/build/bin/examples/server_encryption /certs/server_cert.der /certs/server_key.der
+    restart: unless-stopped
+
+  node-opcua:
+    image: node:20-slim
+    container_name: opcua-node-opcua
+    ports:
+      - "26543:26543"
+    working_dir: /app
+    volumes:
+      - ./node-opcua-server:/app
+    command: >
+      sh -c "cd /app && npm install 2>&1 | tail -1 && node server.js"
+    restart: unless-stopped
+
+  python-asyncua:
+    image: python:3.12-slim
+    container_name: opcua-python-asyncua
+    ports:
+      - "4841:4841"
+    working_dir: /app
+    volumes:
+      - ./python-asyncua-server:/app
+    command: >
+      sh -c "pip install -q asyncua cryptography 2>/dev/null && python server.py"
+    restart: unless-stopped

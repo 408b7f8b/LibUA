@@ -43,9 +43,18 @@ public class Coding
                     return 3 + Coding.CodingSizeUAString(id.StringIdentifier);
                 }
 
+            case NodeIdNetType.ByteString:
+                {
+                    return 3 + Coding.CodingSizeUAByteString(id.ByteStringIdentifier);
+                }
+
+            case NodeIdNetType.Guid:
+                {
+                    return 3 + 16;
+                }
+
             default:
-                // TODO: Handle
-                throw new Exception();
+                throw new NotSupportedException($"NodeId type '{id.IdType}' is not supported for CodingSize calculation");
         }
     }
     public static int CodingSize(QualifiedName qn)
@@ -123,8 +132,12 @@ public class Coding
         if (type == VariantType.DateTime) { return typeof(DateTime); }
         if (type == VariantType.StatusCode) { return typeof(StatusCode); }
         if (type == VariantType.ExtensionObject) { return typeof(ExtensionObject); }
-
-        // TODO: Other types
+        if (type == VariantType.Guid) { return typeof(Guid); }
+        if (type == VariantType.ExpandedNodeId) { return typeof(ExpandedNodeId); }
+        if (type == VariantType.DataValue) { return typeof(DataValue); }
+        if (type == VariantType.DiagnosticInfo) { return typeof(DiagnosticInfo); }
+        if (type == VariantType.XmlElement) { return typeof(string); }
+        if (type == VariantType.Variant) { return typeof(object); }
 
         return null;
     }
@@ -150,8 +163,10 @@ public class Coding
         if (obj is DateTime) { return VariantType.DateTime; }
         if (obj is StatusCode) { return VariantType.StatusCode; }
         if (obj is ExtensionObject) { return VariantType.ExtensionObject; }
-
-        // TODO: Other types
+        if (obj is Guid) { return VariantType.Guid; }
+        if (obj is ExpandedNodeId) { return VariantType.ExpandedNodeId; }
+        if (obj is DataValue) { return VariantType.DataValue; }
+        if (obj is DiagnosticInfo) { return VariantType.DiagnosticInfo; }
 
         return VariantType.Null;
     }
@@ -177,8 +192,10 @@ public class Coding
         if (type == typeof(DateTime)) { return VariantType.DateTime; }
         if (type == typeof(StatusCode)) { return VariantType.StatusCode; }
         if (type == typeof(ExtensionObject)) { return VariantType.ExtensionObject; }
-
-        // TODO: Other types
+        if (type == typeof(Guid)) { return VariantType.Guid; }
+        if (type == typeof(ExpandedNodeId)) { return VariantType.ExpandedNodeId; }
+        if (type == typeof(DataValue)) { return VariantType.DataValue; }
+        if (type == typeof(DiagnosticInfo)) { return VariantType.DiagnosticInfo; }
 
         return VariantType.Null;
     }
@@ -320,20 +337,20 @@ public class Coding
             case (int)VariantType.Double: size += CodingSize((Double)obj); break;
             case (int)VariantType.String: size += CodingSizeUAString((string)obj); break;
             case (int)VariantType.DateTime: size += CodingSize((Int64)0); break;
-            //case (int)VariantType.Guid: size += CodingSize((int)obj); break;
+            case (int)VariantType.Guid: size += 16; break;
             case (int)VariantType.ByteString: size += CodingSizeUAByteString((byte[])obj); break;
-            //case (int)VariantType.XmlElement: size += CodingSize((int)obj); break;
+            case (int)VariantType.XmlElement: size += CodingSizeUAString((string)obj); break;
             case (int)VariantType.NodeId: size += CodingSize((NodeId)obj); break;
-            //case (int)VariantType.ExpandedNodeId: size += CodingSize((int)obj); break;
+            case (int)VariantType.ExpandedNodeId: size += CodingSize(((ExpandedNodeId)obj).NodeId ?? NodeId.Zero); break;
             case (int)VariantType.StatusCode: size += CodingSize((UInt32)obj); break;
             case (int)VariantType.QualifiedName: size += CodingSize((QualifiedName)obj); break;
             case (int)VariantType.LocalizedText: size += CodingSize((LocalizedText)obj); break;
             case (int)VariantType.ExtensionObject: size += CodingSize((ExtensionObject)obj); break;
-            //case (int)VariantType.DataValue: size += CodingSize((int)obj); break;
-            //case (int)VariantType.Variant: size += CodingSize((int)obj); break;
-            //case (int)VariantType.DiagnosticInfo: size += CodingSize((int)obj); break;
+            case (int)VariantType.DataValue: size += VariantCodingSize(obj); break;
+            case (int)VariantType.Variant: size += VariantCodingSize(obj); break;
+            case (int)VariantType.DiagnosticInfo: size += CodingSize((byte)0); break;
             default:
-                throw new Exception("TODO");
+                throw new NotSupportedException($"Unsupported VariantType for size calculation: {(VariantType)(mask & 0x3F)}");
         }
 
         return size;

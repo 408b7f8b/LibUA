@@ -1,4 +1,5 @@
-﻿using LibUA.Core;
+﻿using System;
+using LibUA.Core;
 
 namespace LibUA.ValueTypes;
 
@@ -43,7 +44,7 @@ public static class RangeExtensions
                 Low = low
             };
         }
-        catch
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
         {
             return false;
         }

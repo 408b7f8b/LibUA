@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
@@ -53,6 +54,9 @@ namespace LibUA
         private volatile StatusCode recvHandlerStatus;
         private volatile bool nextPublish = false;
         private HashSet<uint> publishReqs = null;
+        private readonly ConcurrentQueue<(uint subscriptionId, uint sequenceNumber)> pendingAcknowledgements = new();
+
+        public int MaxOutstandingPublishRequests { get; set; } = 2;
         private readonly Lock syncLock = new();
         private readonly Lock recvQueueLock = new();
         private readonly Lock recvNotifyLock = new();
@@ -99,6 +103,18 @@ namespace LibUA
             get { return !IsConnected && config?.AuthToken is not null; }
         }
 
+        /// <summary>
+        /// Certificate validation options. Set before connecting to enable validation.
+        /// Default: null (no validation, backward compatible).
+        /// </summary>
+        public UASecurity.CertificateValidationOptions CertificateValidation { get; set; }
+
+        /// <summary>
+        /// Registry for custom DataType definitions. Populated by LoadDataTypeDefinition() or LoadDataTypesForNamespace().
+        /// Used to automatically decode ExtensionObjects with custom structured types.
+        /// </summary>
+        public LibUA.ValueTypes.DataTypeRegistry TypeRegistry { get; } = new LibUA.ValueTypes.DataTypeRegistry();
+
         public Client(string Target, int Port, int Timeout, int MaximumMessageSize = 1 << 18)
             : this(Target, Port, null, Timeout, MaximumMessageSize)
         {
@@ -124,7 +140,7 @@ namespace LibUA
             {
                 config.RemoteCertificate = new X509Certificate2(serverCert);
             }
-            catch
+            catch (CryptographicException)
             {
                 return StatusCode.BadCertificateInvalid;
             }
@@ -139,7 +155,7 @@ namespace LibUA
             }
         }
 
-        private StatusCode RenewSecureChannel()
+        public StatusCode RenewSecureChannel()
         {
             try
             {
@@ -180,6 +196,7 @@ namespace LibUA
                 else
                 {
                     var certStr = ApplicationCertificate.Export(X509ContentType.Cert);
+                    // OPC UA Part 6, 6.7.2.3: Thumbprint uses SHA-1 (20 bytes) regardless of security policy
                     var serverCertThumbprint = UASecurity.SHACalculate(config.RemoteCertificateString, SecurityPolicy.Basic128Rsa15);
 
                     succeeded &= sendBuf.EncodeUAByteString(certStr);
@@ -190,9 +207,10 @@ namespace LibUA
 
                 if (requestType == SecurityTokenRequestType.Issue)
                 {
+                    // OPC UA Part 6, 6.7.2: Initial sequence number should be random
                     config.LocalSequence = new SLSequence()
                     {
-                        SequenceNumber = 51,
+                        SequenceNumber = (uint)(System.Security.Cryptography.RandomNumberGenerator.GetInt32(1, 1024)),
                         RequestId = 1,
                     };
                 }
@@ -205,7 +223,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -342,7 +360,7 @@ namespace LibUA
                         return StatusCode.BadSecurityPolicyRejected;
                     }
                 }
-                catch
+                catch (IndexOutOfRangeException)
                 {
                     return StatusCode.BadSecurityPolicyRejected;
                 }
@@ -354,12 +372,22 @@ namespace LibUA
                     {
 
                         config.RemoteCertificate = new X509Certificate2(senderCertificate);
-                        if (!UASecurity.VerifyCertificate(config.RemoteCertificate))
+
+                        // Use full validation if configured, otherwise backward-compatible null check
+                        if (CertificateValidation != null)
+                        {
+                            var validationResult = UASecurity.ValidateCertificate(config.RemoteCertificate, CertificateValidation);
+                            if (validationResult != StatusCode.Good)
+                            {
+                                return validationResult;
+                            }
+                        }
+                        else if (!UASecurity.VerifyCertificate(config.RemoteCertificate))
                         {
                             return StatusCode.BadCertificateInvalid;
                         }
                     }
-                    catch
+                    catch (CryptographicException)
                     {
                         return StatusCode.BadCertificateInvalid;
                     }
@@ -503,7 +531,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = new NodeId((uint)0),
                 };
 
@@ -581,7 +609,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -641,6 +669,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numEndpointDescs);
 
                 endpointDescs = new EndpointDescription[numEndpointDescs];
@@ -680,7 +717,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -738,6 +775,15 @@ namespace LibUA
                 if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.FindServersResponse))
                 {
                     return CheckServiceFaultResponse(recvHandler);
+                }
+
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
                 }
 
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDescs);
@@ -857,7 +903,7 @@ namespace LibUA
         {
             if (IsConnected)
             {
-                throw new Exception("Disconnect before connecting again.");
+                throw new InvalidOperationException("Disconnect before connecting again.");
             }
 
             cs = new Semaphore(1, 1);
@@ -951,7 +997,7 @@ namespace LibUA
                     SendBufferSize = 1 << 16,
                     RecvBufferSize = 1 << 16,
                     MaxMessageSize = (uint)MaximumMessageSize,
-                    MaxChunkCount = 1337 + (uint)(MaximumMessageSize + ((1 << 16) - 1)) / (1 << 16),
+                    MaxChunkCount = 0, // 0 = no limit per OPC UA Part 6
                 }
             };
 
@@ -1018,7 +1064,11 @@ namespace LibUA
             if (!recvHandler.RecvBuf.Decode(out config.TL.TransportConfig.MaxMessageSize)) { return StatusCode.BadDecodingError; }
             if (!recvHandler.RecvBuf.Decode(out config.TL.TransportConfig.MaxChunkCount)) { return StatusCode.BadDecodingError; }
 
-            MaximumMessageSize = (int)Math.Min(config.TL.TransportConfig.MaxMessageSize, MaximumMessageSize);
+            // OPC UA Part 6: MaxMessageSize=0 means no limit
+            if (config.TL.TransportConfig.MaxMessageSize > 0)
+            {
+                MaximumMessageSize = (int)Math.Min(config.TL.TransportConfig.MaxMessageSize, MaximumMessageSize);
+            }
 
             //if (!signalled)
             //{
@@ -1179,7 +1229,11 @@ namespace LibUA
                     {
                         bytesRead = socket.Receive(recvBuffer, recvAccumSize, bytesAvailable, SocketFlags.None);
                     }
-                    catch
+                    catch (SocketException)
+                    {
+                        break;
+                    }
+                    catch (ObjectDisposedException)
                     {
                         break;
                     }
@@ -1213,13 +1267,8 @@ namespace LibUA
                         //var sw = new System.Diagnostics.Stopwatch();
                         //sw.Start();
                         consumedSize = Consume(config, new MemoryBuffer(recvBuffer, recvAccumSize));
-                        //sw.Stop();
-                        //if (consumedSize > 0)
-                        //{
-                        //	Console.WriteLine("Client consumed {0} in {1}, total {2}", consumedSize, sw.Elapsed.ToString(), recvAccumSize);
-                        //}
                     }
-                    catch
+                    catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
                     {
                         recvHandlerStatus = StatusCode.BadDecodingError;
                         consumedSize = -1;
@@ -1244,7 +1293,7 @@ namespace LibUA
                     {
                         if (consumedSize > recvAccumSize)
                         {
-                            throw new Exception(string.Format("Consumed {0} but accumulated message size is {1}", consumedSize, recvAccumSize));
+                            throw new InvalidOperationException(string.Format("Consumed {0} but accumulated message size is {1}", consumedSize, recvAccumSize));
                         }
 
                         recvAccumSize = 0;
@@ -1412,6 +1461,11 @@ namespace LibUA
                 }
 
                 byte chunkType = memBuf.Buffer[offset + 3];
+                if (chunkType == 'A')
+                {
+                    // OPC 10000-6, 6.7.2.4: Abort — discard message
+                    return new List<uint>();
+                }
                 if (chunkType != 'C' && chunkType != 'F')
                 {
                     // Invalid chunk type
@@ -1460,6 +1514,7 @@ namespace LibUA
                     (uint)(recvBuf.Buffer[6] << 16) | (uint)(recvBuf.Buffer[7] << 24);
 
                 if (config != null && config.TL != null &&
+                    config.TL.TransportConfig.MaxMessageSize > 0 &&
                     messageSize > config.TL.TransportConfig.MaxMessageSize)
                 {
                     recvHandlerStatus = StatusCode.BadResponseTooLarge;
@@ -1497,6 +1552,13 @@ namespace LibUA
                 if (chunkSizes == null)
                 {
                     return 0;
+                }
+
+                if (chunkSizes.Count == 0)
+                {
+                    // Abort chunk received
+                    recvHandlerStatus = StatusCode.BadRequestInterrupted;
+                    return recvBuf.Capacity;
                 }
 
                 if (config.MessageSecurityMode > MessageSecurityMode.None &&
@@ -1599,8 +1661,18 @@ namespace LibUA
                         recvHandlerStatus = (StatusCode)status;
                     }
                 }
-                catch
+                catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
                 {
+                    // Status decode failed — keep default BadCommunicationError
+                }
+
+                // Signal all waiting requests so they can observe the error
+                lock (recvNotifyLock)
+                {
+                    foreach (var ev in recvNotify.Values)
+                    {
+                        ev.Set();
+                    }
                 }
 
                 return -1;
@@ -1614,6 +1686,20 @@ namespace LibUA
                 succeeded &= recvBuf.Decode(out uint securitySeqNum);
                 succeeded &= recvBuf.Decode(out uint _);
 
+                // OPC 10000-6: Validate sequence number
+                uint expectedSeq = config.RemoteSequence.SequenceNumber + 1;
+                if (expectedSeq > 4294966271u) expectedSeq = 1; // Wrap-around per spec
+
+                if (securitySeqNum != expectedSeq && config.RemoteSequence.SequenceNumber != 0)
+                {
+                    // Backward jump > 1000 indicates replay attack
+                    if (securitySeqNum < config.RemoteSequence.SequenceNumber &&
+                        config.RemoteSequence.SequenceNumber - securitySeqNum < 4294000000u)
+                    {
+                        recvHandlerStatus = StatusCode.BadSecurityChecksFailed;
+                        return -1;
+                    }
+                }
                 config.RemoteSequence.SequenceNumber = securitySeqNum;
 
                 succeeded &= recvBuf.Decode(out NodeId typeId);
@@ -1682,7 +1768,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -1801,13 +1887,13 @@ namespace LibUA
                                 break;
 
                             default:
-                                throw new Exception(string.Format("Identity token algorithm {0} is not supported", usernameToken.Algorithm));
+                                throw new NotSupportedException(string.Format("Identity token algorithm '{0}' is not supported", usernameToken.Algorithm));
                         }
 
                         succeeded &= sendBuf.EncodeUAByteString(crypted);
                         succeeded &= sendBuf.EncodeUAString(usernameToken.Algorithm);
                     }
-                    catch
+                    catch (CryptographicException)
                     {
                         return StatusCode.BadSecurityChecksFailed;
                     }
@@ -1828,7 +1914,7 @@ namespace LibUA
                 }
                 else
                 {
-                    throw new Exception(string.Format("Identity token of type {0} is not supported", identityToken.GetType().ToString()));
+                    throw new NotSupportedException(string.Format("Identity token of type '{0}' is not supported", identityToken.GetType().Name));
                 }
 
                 if (identityToken is UserIdentityX509IdentityToken x509IdentityToken)
@@ -1899,6 +1985,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeUAByteString(out byte[] serverNonce);
                 config.RemoteNonce = serverNonce;
 
@@ -1938,6 +2033,14 @@ namespace LibUA
                 return (StatusCode)recvHandler.Header.ServiceResult;
             }
 
+            // Check if the ResponseHeader indicates a non-good ServiceResult
+            if (recvHandler.Header != null &&
+                Types.StatusCodeIsBad(recvHandler.Header.ServiceResult) &&
+                Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+            {
+                return (StatusCode)recvHandler.Header.ServiceResult;
+            }
+
             return StatusCode.BadUnknownResponse;
         }
 
@@ -1956,7 +2059,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -1969,6 +2072,15 @@ namespace LibUA
                 succeeded &= sendBuf.EncodeUAString((string)null);
                 succeeded &= sendBuf.EncodeUAString(GetEndpointString());
                 succeeded &= sendBuf.EncodeUAString(sessionName);
+
+                // Generate a fresh nonce for CreateSession (must differ from OpenSecureChannel nonce)
+                byte[] sessionNonce = null;
+                if (config.SecurityPolicy != SecurityPolicy.None)
+                {
+                    int nonceSize = UASecurity.NonceLengthForSecurityPolicy(config.SecurityPolicy);
+                    sessionNonce = UASecurity.GenerateRandomBytes(nonceSize);
+                }
+                config.LocalNonce = sessionNonce;
                 succeeded &= sendBuf.EncodeUAByteString(config.LocalNonce);
                 if (ApplicationCertificate == null)
                 {
@@ -2027,18 +2139,20 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.Decode(out NodeId sessionIdToken);
                 succeeded &= recvHandler.RecvBuf.Decode(out NodeId authToken);
                 succeeded &= recvHandler.RecvBuf.Decode(out double revisedSessionTimeout);
 
-                config.TokenLifetime = (uint)(revisedSessionTimeout);
-
-                if (renewTimer != null)
-                {
-                    renewTimer.Stop();
-                    renewTimer.Interval = 0.7 * config.TokenLifetime;
-                    renewTimer.Start();
-                }
+                config.SessionTimeout = (uint)(revisedSessionTimeout);
 
                 config.SessionIdToken = sessionIdToken;
                 config.AuthToken = authToken;
@@ -2051,7 +2165,7 @@ namespace LibUA
                 {
                     config.RemoteCertificate = new X509Certificate2(serverCert);
                 }
-                catch
+                catch (CryptographicException)
                 {
                     return StatusCode.BadSecurityChecksFailed;
                 }
@@ -2070,7 +2184,7 @@ namespace LibUA
             }
         }
 
-        public StatusCode CloseSession()
+        public StatusCode CloseSession(bool deleteSubscriptions = true)
         {
             try
             {
@@ -2085,14 +2199,13 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
                 bool succeeded = true;
                 succeeded &= sendBuf.Encode(new NodeId(RequestCode.CloseSessionRequest));
                 succeeded &= sendBuf.Encode(reqHeader);
-                bool deleteSubscriptions = false;
                 succeeded &= sendBuf.Encode(deleteSubscriptions);
 
                 if (!succeeded)
@@ -2141,6 +2254,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 if (!succeeded)
                 {
                     return StatusCode.BadDecodingError;
@@ -2164,7 +2286,7 @@ namespace LibUA
 
             if (Ids.Count != results.Count)
             {
-                throw new Exception("Number of results must match number of Ids.");
+                throw new ArgumentException(string.Format("Number of results ({0}) must match number of Ids ({1}).", results.Count, Ids.Count), nameof(results));
             }
 
             try
@@ -2244,6 +2366,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
 
                 for (int i = 0; i < numRecv && succeeded; i++)
@@ -2290,7 +2421,7 @@ namespace LibUA
 
             if (Ids.Count != results.Count)
             {
-                throw new Exception("Number of results must match number of Ids.");
+                throw new ArgumentException(string.Format("Number of results ({0}) must match number of Ids ({1}).", results.Count, Ids.Count), nameof(results));
             }
 
             try
@@ -2306,7 +2437,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -2366,6 +2497,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
 
                 uint v;
@@ -2400,6 +2540,299 @@ namespace LibUA
             return Write(Ids, results);
         }
 
+        /// <summary>
+        /// Converts a value to the target VariantType, handling common mismatches
+        /// (e.g., C# int → Int64 when server expects Int64).
+        /// </summary>
+        private static object ConvertToVariantType(object value, VariantType targetType)
+        {
+            if (value == null) return null;
+
+            try
+            {
+                return targetType switch
+                {
+                    VariantType.Boolean => Convert.ToBoolean(value),
+                    VariantType.SByte => Convert.ToSByte(value),
+                    VariantType.Byte => Convert.ToByte(value),
+                    VariantType.Int16 => Convert.ToInt16(value),
+                    VariantType.UInt16 => Convert.ToUInt16(value),
+                    VariantType.Int32 => Convert.ToInt32(value),
+                    VariantType.UInt32 => Convert.ToUInt32(value),
+                    VariantType.Int64 => Convert.ToInt64(value),
+                    VariantType.UInt64 => Convert.ToUInt64(value),
+                    VariantType.Float => Convert.ToSingle(value),
+                    VariantType.Double => Convert.ToDouble(value),
+                    VariantType.String => Convert.ToString(value),
+                    _ => value,
+                };
+            }
+            catch (Exception ex) when (ex is InvalidCastException or OverflowException or FormatException)
+            {
+                return value;
+            }
+        }
+
+        // OPC UA DataType NodeId → VariantType mapping for built-in types
+        private static readonly Dictionary<uint, VariantType> DataTypeToVariantType = new()
+        {
+            { 1, VariantType.Boolean },
+            { 2, VariantType.SByte },
+            { 3, VariantType.Byte },
+            { 4, VariantType.Int16 },
+            { 5, VariantType.UInt16 },
+            { 6, VariantType.Int32 },
+            { 7, VariantType.UInt32 },
+            { 8, VariantType.Int64 },
+            { 9, VariantType.UInt64 },
+            { 10, VariantType.Float },
+            { 11, VariantType.Double },
+            { 12, VariantType.String },
+            { 13, VariantType.DateTime },
+            { 14, VariantType.Guid },
+            { 15, VariantType.ByteString },
+        };
+
+        /// <summary>
+        /// Write values with automatic DataType matching.
+        /// Reads the DataType attribute of each target node and converts the value
+        /// to the expected VariantType before writing.
+        /// </summary>
+        public StatusCode WriteWithTypeCheck(WriteValue[] writeValues, out uint[] results)
+        {
+            results = null;
+
+            // Read DataType attribute for each target node
+            var readIds = new ReadValueId[writeValues.Length];
+            for (int i = 0; i < writeValues.Length; i++)
+            {
+                readIds[i] = new ReadValueId(writeValues[i].NodeId, NodeAttribute.DataType, null, new QualifiedName(0, null));
+            }
+
+            var readRes = Read(readIds, out DataValue[] dataTypes);
+            if (!Types.StatusCodeIsGood((uint)readRes))
+            {
+                // Fallback to regular Write without type check
+                return Write(writeValues, out results);
+            }
+
+            // Convert values to match server's expected DataType
+            var convertedValues = new WriteValue[writeValues.Length];
+            for (int i = 0; i < writeValues.Length; i++)
+            {
+                var wv = writeValues[i];
+                var converted = wv;
+
+                if (dataTypes[i]?.Value is NodeId dataTypeNodeId &&
+                    dataTypeNodeId.NamespaceIndex == 0 &&
+                    DataTypeToVariantType.TryGetValue(dataTypeNodeId.NumericIdentifier, out var targetType))
+                {
+                    var currentType = Coding.GetVariantTypeFromInstance(wv.Value?.Value);
+                    if (currentType != targetType && wv.Value?.Value != null)
+                    {
+                        var convertedVal = ConvertToVariantType(wv.Value.Value, targetType);
+                        converted = new WriteValue(wv.NodeId, wv.AttributeId, wv.IndexRange,
+                            new DataValue(convertedVal, wv.Value.StatusCode, wv.Value.SourceTimestamp, wv.Value.ServerTimestamp));
+                    }
+                }
+
+                convertedValues[i] = converted;
+            }
+
+            return Write(convertedValues, out results);
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        //  Custom DataType discovery (OPC UA Part 3/5)
+        // ══════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Load the StructureDefinition for a specific DataType node.
+        /// Uses the DataTypeDefinition attribute (OPC UA 1.04+).
+        /// Registers the result in TypeRegistry for automatic decoding.
+        /// </summary>
+        public StatusCode LoadDataTypeDefinition(NodeId dataTypeNodeId, out ValueTypes.StructureDefinition definition)
+        {
+            definition = null;
+
+            // 1. Read DataTypeDefinition attribute (AttributeId=26)
+            //    Some servers use AttributeId 23 (DataTypeDefinition per 1.04 spec is id 26)
+            //    Try the standard value attribute first — some servers expose it as Value of the encoding node
+            var readRes = Read(new ReadValueId[]
+            {
+                new(dataTypeNodeId, (NodeAttribute)26, null, new QualifiedName(0, null)),
+            }, out DataValue[] dvs);
+
+            // 2. Browse for Default Binary encoding node
+            NodeId encodingNodeId = null;
+            var browseRes = Browse(new BrowseDescription[]
+            {
+                new(dataTypeNodeId, BrowseDirection.Forward,
+                    new NodeId(0, 38), // HasEncoding reference type
+                    false, 0, BrowseResultMask.All)
+            }, 10, out BrowseResult[] browseResults);
+
+            if (Types.StatusCodeIsGood((uint)browseRes) && browseResults?.Length > 0 && browseResults[0].Refs != null)
+            {
+                foreach (var r in browseResults[0].Refs)
+                {
+                    if (r.BrowseName.Name == "Default Binary")
+                    {
+                        encodingNodeId = r.TargetId;
+                        break;
+                    }
+                }
+            }
+
+            // 3. Try to decode the DataTypeDefinition
+            if (Types.StatusCodeIsGood((uint)readRes) && dvs?.Length > 0 && dvs[0]?.Value != null)
+            {
+                // The DataTypeDefinition comes as ExtensionObject containing StructureDefinition
+                if (dvs[0].Value is ExtensionObject eo && eo.Body != null)
+                {
+                    var bodyBuf = new MemoryBuffer(eo.Body);
+                    definition = DecodeStructureDefinition(bodyBuf);
+                }
+                // Some servers return the definition directly as a decoded object
+                else if (dvs[0].Value is ValueTypes.StructureDefinition sd)
+                {
+                    definition = sd;
+                }
+            }
+
+            if (definition != null)
+            {
+                if (encodingNodeId != null)
+                    definition.DefaultEncodingId = encodingNodeId;
+
+                TypeRegistry.Register(encodingNodeId, dataTypeNodeId, definition);
+                return StatusCode.Good;
+            }
+
+            return StatusCode.BadNotSupported;
+        }
+
+        /// <summary>
+        /// Load all custom DataType definitions for a given namespace index.
+        /// Browses from the Structure DataType (i=22) and reads DataTypeDefinition for each subtype.
+        /// </summary>
+        public StatusCode LoadDataTypesForNamespace(ushort namespaceIndex)
+        {
+            int loaded = 0;
+
+            // Browse subtypes of Structure (i=22)
+            var queue = new Queue<NodeId>();
+            queue.Enqueue(new NodeId(0, 22)); // Structure base type
+
+            var visited = new HashSet<string>();
+
+            while (queue.Count > 0)
+            {
+                var current = queue.Dequeue();
+                string key = $"{current.NamespaceIndex}:{current.NumericIdentifier}";
+                if (visited.Contains(key)) continue;
+                visited.Add(key);
+
+                // Browse subtypes (HasSubtype reference, forward)
+                var browseRes = Browse(new BrowseDescription[]
+                {
+                    new(current, BrowseDirection.Forward,
+                        new NodeId(0, 45), // HasSubtype
+                        false, 0, BrowseResultMask.All)
+                }, 1000, out BrowseResult[] results);
+
+                if (!Types.StatusCodeIsGood((uint)browseRes) || results == null || results.Length == 0)
+                    continue;
+
+                if (results[0].Refs == null) continue;
+
+                foreach (var r in results[0].Refs)
+                {
+                    if (r.TargetId == null) continue;
+                    queue.Enqueue(r.TargetId);
+
+                    // Only load types from the requested namespace
+                    if (r.TargetId.NamespaceIndex != namespaceIndex)
+                        continue;
+
+                    LoadDataTypeDefinition(r.TargetId, out _);
+                    loaded++;
+                }
+            }
+
+            return loaded > 0 ? StatusCode.Good : StatusCode.GoodNoData;
+        }
+
+        /// <summary>
+        /// Try to decode an ExtensionObject using the TypeRegistry.
+        /// Returns a StructuredValue if the type is known, null otherwise.
+        /// </summary>
+        public ValueTypes.StructuredValue TryDecodeExtensionObject(ExtensionObject eo)
+        {
+            if (eo?.Body == null || eo.TypeId == null) return null;
+
+            if (!TypeRegistry.TryGetByEncodingId(eo.TypeId, out var def))
+                return null;
+
+            var buf = new MemoryBuffer(eo.Body);
+            return ValueTypes.StructuredTypeCodec.Decode(buf, def, TypeRegistry);
+        }
+
+        private static ValueTypes.StructureDefinition DecodeStructureDefinition(MemoryBuffer buf)
+        {
+            var def = new ValueTypes.StructureDefinition();
+
+            if (!buf.Decode(out NodeId defaultEncodingId)) return null;
+            def.DefaultEncodingId = defaultEncodingId;
+
+            if (!buf.Decode(out NodeId baseDataType)) return null;
+            def.BaseDataType = baseDataType;
+
+            if (!buf.Decode(out int structureType)) return null;
+            def.StructureType = (ValueTypes.StructureType)structureType;
+
+            if (!buf.Decode(out int numFields)) return null;
+            if (numFields < 0) numFields = 0;
+
+            def.Fields = new ValueTypes.StructureField[numFields];
+            for (int i = 0; i < numFields; i++)
+            {
+                var field = new ValueTypes.StructureField();
+
+                if (!buf.DecodeUAString(out string name)) return null;
+                field.Name = name;
+
+                if (!buf.Decode(out LocalizedText desc)) return null;
+                field.Description = desc;
+
+                if (!buf.Decode(out NodeId dataType)) return null;
+                field.DataType = dataType;
+
+                if (!buf.Decode(out int valueRank)) return null;
+                field.ValueRank = valueRank;
+
+                if (!buf.Decode(out int numDims)) return null;
+                if (numDims > 0)
+                {
+                    field.ArrayDimensions = new uint[numDims];
+                    for (int j = 0; j < numDims; j++)
+                    {
+                        if (!buf.Decode(out field.ArrayDimensions[j])) return null;
+                    }
+                }
+
+                if (!buf.Decode(out uint maxStringLen)) return null;
+                field.MaxStringLength = maxStringLen;
+
+                if (!buf.Decode(out bool isOptional)) return null;
+                field.IsOptional = isOptional;
+
+                def.Fields[i] = field;
+            }
+
+            return def;
+        }
+
         public StatusCode AddNodes(AddNodesItem[] addNodesItems, out AddNodesResult[] results)
         {
             results = null;
@@ -2417,7 +2850,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -2477,6 +2910,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
 
                 results = new AddNodesResult[numRecv];
@@ -2521,7 +2963,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -2581,6 +3023,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
 
                 results = new uint[numRecv];
@@ -2625,7 +3076,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -2685,6 +3136,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
 
                 results = new uint[numRecv];
@@ -2729,7 +3189,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -2789,6 +3249,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
 
                 results = new uint[numRecv];
@@ -2833,7 +3302,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -2902,6 +3371,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
 
                 results = new BrowseResult[numRecv];
@@ -2959,7 +3437,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -3018,6 +3496,15 @@ namespace LibUA
                 if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.BrowseNextResponse))
                 {
                     return CheckServiceFaultResponse(recvHandler);
+                }
+
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
                 }
 
                 if (!releaseContinuationPoints)
@@ -3084,7 +3571,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -3161,7 +3648,7 @@ namespace LibUA
                 }
                 else
                 {
-                    throw new Exception(string.Format("History read details of type {0} is not supported", historyReadDetails.GetType().ToString()));
+                    throw new NotSupportedException(string.Format("History read details of type '{0}' is not supported", historyReadDetails.GetType().Name));
                 }
 
                 succeeded &= sendBuf.Encode((UInt32)timestampsToReturn);
@@ -3221,6 +3708,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 if (!releaseContinuationPoints)
                 {
                     succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
@@ -3234,41 +3730,50 @@ namespace LibUA
                         succeeded &= recvHandler.RecvBuf.DecodeUAByteString(out byte[] contPoint);
                         succeeded &= recvHandler.RecvBuf.Decode(out NodeId type);
                         succeeded &= recvHandler.RecvBuf.Decode(out byte eoBodyMask);
-                        if (eoBodyMask != 1)
+
+                        // OPC UA Part 6, 5.2.2.15: eoBodyMask == 0 means null/empty ExtensionObject (no history data)
+                        if (eoBodyMask == 0)
                         {
-                            return StatusCode.BadDataEncodingInvalid;
+                            results[i] = new HistoryReadResult(status, contPoint, Array.Empty<DataValue>());
                         }
-                        succeeded &= recvHandler.RecvBuf.Decode(out uint eoSize);
-
-                        if (type.EqualsNumeric(0, (uint)UAConst.HistoryData_Encoding_DefaultBinary))
+                        else if (eoBodyMask == 1)
                         {
-                            succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDvs);
-                            DataValue[] dvs = new DataValue[numDvs];
-                            for (int j = 0; j < numDvs; j++)
-                            {
-                                succeeded &= recvHandler.RecvBuf.Decode(out dvs[j]);
-                            }
+                            succeeded &= recvHandler.RecvBuf.Decode(out uint eoSize);
 
-                            results[i] = new HistoryReadResult(status, contPoint, dvs);
-                        }
-                        else if (type.EqualsNumeric(0, (uint)UAConst.HistoryEvent_Encoding_DefaultBinary))
-                        {
-                            succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDvs);
-
-                            DataValue[] dvs = new DataValue[numDvs];
-                            for (int j = 0; succeeded && j < numDvs; j++)
+                            if (type.EqualsNumeric(0, (uint)UAConst.HistoryData_Encoding_DefaultBinary))
                             {
-                                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numFields);
-                                object[] fields = new object[numFields];
-                                for (int k = 0; succeeded && k < numFields; k++)
+                                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDvs);
+                                DataValue[] dvs = new DataValue[numDvs];
+                                for (int j = 0; j < numDvs; j++)
                                 {
-                                    succeeded &= recvHandler.RecvBuf.VariantDecode(out fields[k]);
+                                    succeeded &= recvHandler.RecvBuf.Decode(out dvs[j]);
                                 }
 
-                                dvs[j] = new DataValue(fields);
+                                results[i] = new HistoryReadResult(status, contPoint, dvs);
                             }
+                            else if (type.EqualsNumeric(0, (uint)UAConst.HistoryEvent_Encoding_DefaultBinary))
+                            {
+                                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDvs);
 
-                            results[i] = new HistoryReadResult(status, contPoint, dvs);
+                                DataValue[] dvs = new DataValue[numDvs];
+                                for (int j = 0; succeeded && j < numDvs; j++)
+                                {
+                                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numFields);
+                                    object[] fields = new object[numFields];
+                                    for (int k = 0; succeeded && k < numFields; k++)
+                                    {
+                                        succeeded &= recvHandler.RecvBuf.VariantDecode(out fields[k]);
+                                    }
+
+                                    dvs[j] = new DataValue(fields);
+                                }
+
+                                results[i] = new HistoryReadResult(status, contPoint, dvs);
+                            }
+                            else
+                            {
+                                return StatusCode.BadDataEncodingInvalid;
+                            }
                         }
                         else
                         {
@@ -3318,7 +3823,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -3392,6 +3897,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
 
                 results = new uint[numRecv];
@@ -3436,7 +3950,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -3496,6 +4010,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
 
                 results = new BrowsePathResult[numRecv];
@@ -3540,7 +4063,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -3606,6 +4129,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
 
                 results = new CallMethodResult[numRecv];
@@ -3627,24 +4159,8 @@ namespace LibUA
                         succeeded &= recvHandler.RecvBuf.Decode(out resultStatus[j]);
                     }
 
-                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDiagnosticInfos);
-                    if (numDiagnosticInfos > 0)
-                    {
-                        if (numDiagnosticInfos == uint.MaxValue)
-                        {
-                            return StatusCode.BadTypeMismatch;
-                        }
-
-                        // TODO: Read DiagnosticInfo
-                        for (int j = 0; j < numDiagnosticInfos; j++)
-                        {
-                            succeeded &= recvHandler.RecvBuf.Decode(out byte mask);
-                            if (mask != 0)
-                            {
-                                return StatusCode.BadNotImplemented;
-                            }
-                        }
-                    }
+                    // Skip DiagnosticInfo array
+                    succeeded &= recvHandler.RecvBuf.Decode(out DiagnosticInfo[] _);
 
                     succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numOutputs);
                     if (numOutputs == uint.MaxValue)
@@ -3679,6 +4195,618 @@ namespace LibUA
             }
         }
 
+        // ══════════════════════════════════════════════════════════════════
+        //  Alarms & Conditions convenience methods (OPC UA Part 9)
+        //  These wrap the Call service for standard Condition methods.
+        // ══════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Acknowledge a condition/alarm. EventId and Comment from the event notification.
+        /// </summary>
+        public StatusCode AcknowledgeCondition(NodeId conditionId, byte[] eventId, string comment = null)
+        {
+            // Acknowledge MethodId = ConditionType.Acknowledge (i=9111)
+            return Call(new CallMethodRequest[]
+            {
+                new(conditionId, new NodeId(0, 9111), new object[]
+                {
+                    eventId,
+                    new LocalizedText(comment ?? "")
+                })
+            }, out _);
+        }
+
+        /// <summary>
+        /// Confirm a condition/alarm.
+        /// </summary>
+        public StatusCode ConfirmCondition(NodeId conditionId, byte[] eventId, string comment = null)
+        {
+            // Confirm MethodId = ConditionType.Confirm (i=9113)
+            return Call(new CallMethodRequest[]
+            {
+                new(conditionId, new NodeId(0, 9113), new object[]
+                {
+                    eventId,
+                    new LocalizedText(comment ?? "")
+                })
+            }, out _);
+        }
+
+        /// <summary>
+        /// Add a comment to a condition.
+        /// </summary>
+        public StatusCode AddConditionComment(NodeId conditionId, byte[] eventId, string comment)
+        {
+            // AddComment MethodId = ConditionType.AddComment (i=9029)
+            return Call(new CallMethodRequest[]
+            {
+                new(conditionId, new NodeId(0, 9029), new object[]
+                {
+                    eventId,
+                    new LocalizedText(comment)
+                })
+            }, out _);
+        }
+
+        /// <summary>
+        /// Enable a condition.
+        /// </summary>
+        public StatusCode EnableCondition(NodeId conditionId)
+        {
+            // Enable MethodId = ConditionType.Enable (i=9027)
+            return Call(new CallMethodRequest[]
+            {
+                new(conditionId, new NodeId(0, 9027), Array.Empty<object>())
+            }, out _);
+        }
+
+        /// <summary>
+        /// Disable a condition.
+        /// </summary>
+        public StatusCode DisableCondition(NodeId conditionId)
+        {
+            // Disable MethodId = ConditionType.Disable (i=9028)
+            return Call(new CallMethodRequest[]
+            {
+                new(conditionId, new NodeId(0, 9028), Array.Empty<object>())
+            }, out _);
+        }
+
+        /// <summary>
+        /// Request a ConditionRefresh for a subscription. Forces server to resend current state of all conditions.
+        /// </summary>
+        public StatusCode ConditionRefresh(uint subscriptionId)
+        {
+            // ConditionRefresh MethodId = ConditionType.ConditionRefresh (i=3875)
+            return Call(new CallMethodRequest[]
+            {
+                new(new NodeId(0, (uint)UAConst.ConditionType), new NodeId(0, 3875), new object[]
+                {
+                    subscriptionId
+                })
+            }, out _);
+        }
+
+        /// <summary>
+        /// Shelve an alarm with a timed duration.
+        /// </summary>
+        public StatusCode TimedShelve(NodeId alarmId, double shelvingTime)
+        {
+            // TimedShelve on the ShelvedStateMachine — browse to find the actual method node
+            // Standard MethodId for ShelvedStateMachineType.TimedShelve (i=2949)
+            return Call(new CallMethodRequest[]
+            {
+                new(alarmId, new NodeId(0, 2949), new object[] { shelvingTime })
+            }, out _);
+        }
+
+        /// <summary>
+        /// One-shot shelve an alarm (shelved until manually unshelved).
+        /// </summary>
+        public StatusCode OneShotShelve(NodeId alarmId)
+        {
+            return Call(new CallMethodRequest[]
+            {
+                new(alarmId, new NodeId(0, 2948), Array.Empty<object>())
+            }, out _);
+        }
+
+        /// <summary>
+        /// Unshelve a shelved alarm.
+        /// </summary>
+        public StatusCode Unshelve(NodeId alarmId)
+        {
+            return Call(new CallMethodRequest[]
+            {
+                new(alarmId, new NodeId(0, 2947), Array.Empty<object>())
+            }, out _);
+        }
+
+        /// <summary>
+        /// Respond to a DialogConditionType prompt.
+        /// </summary>
+        public StatusCode RespondToDialog(NodeId conditionId, int selectedResponse)
+        {
+            // DialogConditionType.Respond (i=9069)
+            return Call(new CallMethodRequest[]
+            {
+                new(conditionId, new NodeId(0, 9069), new object[] { selectedResponse })
+            }, out _);
+        }
+
+        /// <summary>
+        /// Silence an alarm (suppress audible notification). OPC UA 1.04+.
+        /// </summary>
+        public StatusCode SilenceAlarm(NodeId alarmId)
+        {
+            // AlarmConditionType.Silence (i=16402)
+            return Call(new CallMethodRequest[]
+            {
+                new(alarmId, new NodeId(0, 16402), Array.Empty<object>())
+            }, out _);
+        }
+
+        /// <summary>
+        /// Suppress an alarm (hide from operator view). OPC UA 1.04+.
+        /// </summary>
+        public StatusCode SuppressAlarm(NodeId alarmId)
+        {
+            // AlarmConditionType.Suppress (i=16403)
+            return Call(new CallMethodRequest[]
+            {
+                new(alarmId, new NodeId(0, 16403), Array.Empty<object>())
+            }, out _);
+        }
+
+        /// <summary>
+        /// Unsuppress a previously suppressed alarm. OPC UA 1.04+.
+        /// </summary>
+        public StatusCode UnsuppressAlarm(NodeId alarmId)
+        {
+            // AlarmConditionType.Unsuppress (i=16404)
+            return Call(new CallMethodRequest[]
+            {
+                new(alarmId, new NodeId(0, 16404), Array.Empty<object>())
+            }, out _);
+        }
+
+        /// <summary>
+        /// Remove alarm from service (maintenance mode). OPC UA 1.04+.
+        /// </summary>
+        public StatusCode RemoveAlarmFromService(NodeId alarmId)
+        {
+            // AlarmConditionType.RemoveFromService (i=16405)
+            return Call(new CallMethodRequest[]
+            {
+                new(alarmId, new NodeId(0, 16405), Array.Empty<object>())
+            }, out _);
+        }
+
+        /// <summary>
+        /// Place alarm back in service after maintenance. OPC UA 1.04+.
+        /// </summary>
+        public StatusCode PlaceAlarmInService(NodeId alarmId)
+        {
+            // AlarmConditionType.PlaceInService (i=16406)
+            return Call(new CallMethodRequest[]
+            {
+                new(alarmId, new NodeId(0, 16406), Array.Empty<object>())
+            }, out _);
+        }
+
+        /// <summary>
+        /// Reset a latched alarm. OPC UA 1.04+.
+        /// </summary>
+        public StatusCode ResetAlarm(NodeId alarmId)
+        {
+            // AlarmConditionType.Reset (i=16407)
+            return Call(new CallMethodRequest[]
+            {
+                new(alarmId, new NodeId(0, 16407), Array.Empty<object>())
+            }, out _);
+        }
+
+        /// <summary>
+        /// Request a ConditionRefresh2 with MonitoredItem filter. OPC UA 1.04+.
+        /// More efficient than ConditionRefresh — only refreshes matching conditions.
+        /// </summary>
+        public StatusCode ConditionRefresh2(uint subscriptionId, uint monitoredItemId)
+        {
+            // ConditionType.ConditionRefresh2 (i=12917)
+            return Call(new CallMethodRequest[]
+            {
+                new(new NodeId(0, (uint)UAConst.ConditionType), new NodeId(0, 12917), new object[]
+                {
+                    subscriptionId,
+                    monitoredItemId
+                })
+            }, out _);
+        }
+
+        /// <summary>
+        /// Creates an EventFilter for comprehensive Alarm & Condition monitoring.
+        /// Includes all standard fields per OPC UA Part 9.
+        /// </summary>
+        public static EventFilter CreateAlarmEventFilter()
+        {
+            return new EventFilter(new SimpleAttributeOperand[]
+            {
+                // Core event fields
+                new(new[] { new QualifiedName("EventId") }),
+                new(new[] { new QualifiedName("EventType") }),
+                new(new[] { new QualifiedName("SourceNode") }),
+                new(new[] { new QualifiedName("SourceName") }),
+                new(new[] { new QualifiedName("Time") }),
+                new(new[] { new QualifiedName("ReceiveTime") }),
+                new(new[] { new QualifiedName("Message") }),
+                new(new[] { new QualifiedName("Severity") }),
+                // Condition fields
+                new(new[] { new QualifiedName("ConditionName") }),
+                new(new[] { new QualifiedName("ConditionClassId") }),
+                new(new[] { new QualifiedName("ConditionClassName") }),
+                new(new[] { new QualifiedName("BranchId") }),
+                new(new[] { new QualifiedName("Retain") }),
+                new(new[] { new QualifiedName("Comment") }),
+                new(new[] { new QualifiedName("Comment"), new QualifiedName("SourceTimestamp") }),
+                new(new[] { new QualifiedName("ClientUserId") }),
+                // State fields
+                new(new[] { new QualifiedName("EnabledState"), new QualifiedName("Id") }),
+                new(new[] { new QualifiedName("AckedState"), new QualifiedName("Id") }),
+                new(new[] { new QualifiedName("ConfirmedState"), new QualifiedName("Id") }),
+                new(new[] { new QualifiedName("ActiveState"), new QualifiedName("Id") }),
+                new(new[] { new QualifiedName("ActiveState"), new QualifiedName("EffectiveDisplayName") }),
+                new(new[] { new QualifiedName("SuppressedState"), new QualifiedName("Id") }),
+                new(new[] { new QualifiedName("ShelvingState"), new QualifiedName("CurrentState") }),
+                // Alarm-specific fields
+                new(new[] { new QualifiedName("LastSeverity") }),
+                new(new[] { new QualifiedName("Quality") }),
+                new(new[] { new QualifiedName("Quality"), new QualifiedName("SourceTimestamp") }),
+            }, null);
+        }
+
+        /// <summary>
+        /// Index constants for the fields returned by CreateAlarmEventFilter().
+        /// Use these to access specific fields in the event notification array.
+        /// </summary>
+        public static class AlarmField
+        {
+            public const int EventId = 0;
+            public const int EventType = 1;
+            public const int SourceNode = 2;
+            public const int SourceName = 3;
+            public const int Time = 4;
+            public const int ReceiveTime = 5;
+            public const int Message = 6;
+            public const int Severity = 7;
+            public const int ConditionName = 8;
+            public const int ConditionClassId = 9;
+            public const int ConditionClassName = 10;
+            public const int BranchId = 11;
+            public const int Retain = 12;
+            public const int Comment = 13;
+            public const int CommentSourceTimestamp = 14;
+            public const int ClientUserId = 15;
+            public const int EnabledStateId = 16;
+            public const int AckedStateId = 17;
+            public const int ConfirmedStateId = 18;
+            public const int ActiveStateId = 19;
+            public const int ActiveStateDisplayName = 20;
+            public const int SuppressedStateId = 21;
+            public const int ShelvingState = 22;
+            public const int LastSeverity = 23;
+            public const int Quality = 24;
+            public const int QualitySourceTimestamp = 25;
+        }
+
+        public StatusCode RegisterNodes(NodeId[] nodesToRegister, out NodeId[] registeredNodeIds)
+        {
+            registeredNodeIds = null;
+
+            try
+            {
+                cs.WaitOne();
+                using var sendBuf = new MemoryBuffer(MaximumMessageSize);
+                var headerRes = EncodeMessageHeader(sendBuf, false);
+                if (headerRes != StatusCode.Good)
+                {
+                    return headerRes;
+                }
+
+                var reqHeader = new RequestHeader()
+                {
+                    RequestHandle = nextRequestHandle++,
+                    Timestamp = DateTime.UtcNow,
+                    AuthToken = config.AuthToken,
+                };
+
+                bool succeeded = true;
+                succeeded &= sendBuf.Encode(new NodeId(RequestCode.RegisterNodesRequest));
+                succeeded &= sendBuf.Encode(reqHeader);
+
+                succeeded &= sendBuf.Encode((UInt32)nodesToRegister.Length);
+                for (int i = 0; i < nodesToRegister.Length; i++)
+                {
+                    succeeded &= sendBuf.Encode(nodesToRegister[i]);
+                }
+
+                if (!succeeded)
+                {
+                    return StatusCode.BadEncodingLimitsExceeded;
+                }
+
+                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                var recvEv = new ManualResetEvent(false);
+                lock (recvNotifyLock)
+                {
+                    recvNotify[recvKey] = recvEv;
+                }
+
+                var sendRes = MessageSecureAndSend(config, sendBuf);
+                if (sendRes != StatusCode.Good)
+                {
+                    return sendRes;
+                }
+
+                bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                lock (recvNotifyLock)
+                {
+                    recvNotify.Remove(recvKey);
+                }
+
+                if (!signalled)
+                {
+                    return StatusCode.BadRequestTimeout;
+                }
+
+                RecvHandler recvHandler = null;
+                lock (recvQueueLock)
+                {
+                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    {
+                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                    }
+
+                    recvQueue.Remove(recvKey);
+                }
+
+                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.RegisterNodesResponse))
+                {
+                    return CheckServiceFaultResponse(recvHandler);
+                }
+
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
+                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
+                registeredNodeIds = new NodeId[numResults];
+                for (int i = 0; i < numResults; i++)
+                {
+                    succeeded &= recvHandler.RecvBuf.Decode(out registeredNodeIds[i]);
+                }
+
+                if (!succeeded)
+                {
+                    return StatusCode.BadDecodingError;
+                }
+
+                return StatusCode.Good;
+            }
+            finally
+            {
+                cs.Release();
+                CheckPostCall();
+            }
+        }
+
+        public StatusCode UnregisterNodes(NodeId[] nodesToUnregister)
+        {
+            try
+            {
+                cs.WaitOne();
+                using var sendBuf = new MemoryBuffer(MaximumMessageSize);
+                var headerRes = EncodeMessageHeader(sendBuf, false);
+                if (headerRes != StatusCode.Good)
+                {
+                    return headerRes;
+                }
+
+                var reqHeader = new RequestHeader()
+                {
+                    RequestHandle = nextRequestHandle++,
+                    Timestamp = DateTime.UtcNow,
+                    AuthToken = config.AuthToken,
+                };
+
+                bool succeeded = true;
+                succeeded &= sendBuf.Encode(new NodeId(RequestCode.UnregisterNodesRequest));
+                succeeded &= sendBuf.Encode(reqHeader);
+
+                succeeded &= sendBuf.Encode((UInt32)nodesToUnregister.Length);
+                for (int i = 0; i < nodesToUnregister.Length; i++)
+                {
+                    succeeded &= sendBuf.Encode(nodesToUnregister[i]);
+                }
+
+                if (!succeeded)
+                {
+                    return StatusCode.BadEncodingLimitsExceeded;
+                }
+
+                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                var recvEv = new ManualResetEvent(false);
+                lock (recvNotifyLock)
+                {
+                    recvNotify[recvKey] = recvEv;
+                }
+
+                var sendRes = MessageSecureAndSend(config, sendBuf);
+                if (sendRes != StatusCode.Good)
+                {
+                    return sendRes;
+                }
+
+                bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                lock (recvNotifyLock)
+                {
+                    recvNotify.Remove(recvKey);
+                }
+
+                if (!signalled)
+                {
+                    return StatusCode.BadRequestTimeout;
+                }
+
+                RecvHandler recvHandler = null;
+                lock (recvQueueLock)
+                {
+                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    {
+                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                    }
+
+                    recvQueue.Remove(recvKey);
+                }
+
+                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.UnregisterNodesResponse))
+                {
+                    return CheckServiceFaultResponse(recvHandler);
+                }
+
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
+                return StatusCode.Good;
+            }
+            finally
+            {
+                cs.Release();
+                CheckPostCall();
+            }
+        }
+
+        public StatusCode SetMonitoringMode(uint subscriptionId, MonitoringMode monitoringMode, uint[] monitoredItemIds, out uint[] results)
+        {
+            results = null;
+
+            try
+            {
+                cs.WaitOne();
+                using var sendBuf = new MemoryBuffer(MaximumMessageSize);
+                var headerRes = EncodeMessageHeader(sendBuf, false);
+                if (headerRes != StatusCode.Good)
+                {
+                    return headerRes;
+                }
+
+                var reqHeader = new RequestHeader()
+                {
+                    RequestHandle = nextRequestHandle++,
+                    Timestamp = DateTime.UtcNow,
+                    AuthToken = config.AuthToken,
+                };
+
+                bool succeeded = true;
+                succeeded &= sendBuf.Encode(new NodeId(RequestCode.SetMonitoringModeRequest));
+                succeeded &= sendBuf.Encode(reqHeader);
+
+                succeeded &= sendBuf.Encode(subscriptionId);
+                succeeded &= sendBuf.Encode((UInt32)monitoringMode);
+                succeeded &= sendBuf.Encode((UInt32)monitoredItemIds.Length);
+                for (int i = 0; i < monitoredItemIds.Length; i++)
+                {
+                    succeeded &= sendBuf.Encode(monitoredItemIds[i]);
+                }
+
+                if (!succeeded)
+                {
+                    return StatusCode.BadEncodingLimitsExceeded;
+                }
+
+                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                var recvEv = new ManualResetEvent(false);
+                lock (recvNotifyLock)
+                {
+                    recvNotify[recvKey] = recvEv;
+                }
+
+                var sendRes = MessageSecureAndSend(config, sendBuf);
+                if (sendRes != StatusCode.Good)
+                {
+                    return sendRes;
+                }
+
+                bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                lock (recvNotifyLock)
+                {
+                    recvNotify.Remove(recvKey);
+                }
+
+                if (!signalled)
+                {
+                    return StatusCode.BadRequestTimeout;
+                }
+
+                RecvHandler recvHandler = null;
+                lock (recvQueueLock)
+                {
+                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    {
+                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                    }
+
+                    recvQueue.Remove(recvKey);
+                }
+
+                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.SetMonitoringModeResponse))
+                {
+                    return CheckServiceFaultResponse(recvHandler);
+                }
+
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
+                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
+                results = new uint[numResults];
+                for (int i = 0; i < numResults; i++)
+                {
+                    succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
+                }
+
+                if (!succeeded)
+                {
+                    return StatusCode.BadDecodingError;
+                }
+
+                return StatusCode.Good;
+            }
+            finally
+            {
+                cs.Release();
+                CheckPostCall();
+            }
+        }
+
         public StatusCode CreateSubscription(double RequestedPublishingInterval, UInt32 MaxNotificationsPerPublish, bool PublishingEnabled, byte Priority, out uint result)
         {
             result = 0xFFFFFFFFu;
@@ -3696,7 +4824,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -3757,6 +4885,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.Decode(out result);
 
                 succeeded &= recvHandler.RecvBuf.Decode(out double revisedPublishInterval);
@@ -3774,15 +4911,17 @@ namespace LibUA
                 CheckPostCall();
             }
 
-            lock (publishReqsLock)
+            // Send publish requests up to the limit
+            while (true)
             {
-                if (publishReqs.Count > 0)
-                {
-                    return StatusCode.Good;
-                }
+                int count;
+                lock (publishReqsLock) { count = publishReqs.Count; }
+                if (count >= MaxOutstandingPublishRequests) break;
+                var res = PublishRequest();
+                if (res != StatusCode.Good) return res;
             }
 
-            return PublishRequest();
+            return StatusCode.Good;
         }
 
         public StatusCode ModifySubscription(uint subscriptionId, double RequestedPublishingInterval, UInt32 MaxNotificationsPerPublish, bool PublishingEnabled, byte Priority, out uint result)
@@ -3802,7 +4941,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -3865,6 +5004,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.Decode(out double revisedPublishInterval);
                 succeeded &= recvHandler.RecvBuf.Decode(out uint revisedLifetimeCount);
                 succeeded &= recvHandler.RecvBuf.Decode(out uint revisedMaxKeepAliveCount);
@@ -3901,7 +5049,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -3961,6 +5109,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
                 results = new uint[numResults];
                 for (int i = 0; i < numResults; i++)
@@ -3973,6 +5130,243 @@ namespace LibUA
                     return StatusCode.BadDecodingError;
                 }
 
+                return StatusCode.Good;
+            }
+            finally
+            {
+                cs.Release();
+                CheckPostCall();
+            }
+        }
+
+        public StatusCode TransferSubscriptions(uint[] subscriptionIds, bool sendInitialValues, out uint[] results)
+        {
+            results = null;
+
+            try
+            {
+                cs.WaitOne();
+                using var sendBuf = new MemoryBuffer(MaximumMessageSize);
+                var headerRes = EncodeMessageHeader(sendBuf, false);
+                if (headerRes != StatusCode.Good) return headerRes;
+
+                var reqHeader = new RequestHeader()
+                {
+                    RequestHandle = nextRequestHandle++,
+                    Timestamp = DateTime.UtcNow,
+                    AuthToken = config.AuthToken,
+                };
+
+                bool succeeded = true;
+                succeeded &= sendBuf.Encode(new NodeId(RequestCode.TransferSubscriptionsRequest));
+                succeeded &= sendBuf.Encode(reqHeader);
+
+                succeeded &= sendBuf.Encode((UInt32)subscriptionIds.Length);
+                for (int i = 0; i < subscriptionIds.Length; i++)
+                    succeeded &= sendBuf.Encode(subscriptionIds[i]);
+                succeeded &= sendBuf.Encode(sendInitialValues);
+
+                if (!succeeded) return StatusCode.BadEncodingLimitsExceeded;
+
+                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                var recvEv = new ManualResetEvent(false);
+                lock (recvNotifyLock) { recvNotify[recvKey] = recvEv; }
+
+                var sendRes = MessageSecureAndSend(config, sendBuf);
+                if (sendRes != StatusCode.Good) return sendRes;
+
+                bool signalled = recvEv.WaitOne(Timeout * 1000);
+                lock (recvNotifyLock) { recvNotify.Remove(recvKey); }
+                if (!signalled) return StatusCode.BadRequestTimeout;
+
+                RecvHandler recvHandler = null;
+                lock (recvQueueLock)
+                {
+                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                    recvQueue.Remove(recvKey);
+                }
+
+                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.TransferSubscriptionsResponse))
+                    return CheckServiceFaultResponse(recvHandler);
+
+                if (recvHandler.Header != null && Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
+                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
+                results = new uint[numResults];
+                for (int i = 0; i < numResults; i++)
+                {
+                    // TransferResult: StatusCode + AvailableSequenceNumbers[]
+                    succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numSeqNums);
+                    for (int j = 0; j < numSeqNums; j++)
+                        succeeded &= recvHandler.RecvBuf.Decode(out uint _);
+                }
+
+                if (!succeeded) return StatusCode.BadDecodingError;
+                return StatusCode.Good;
+            }
+            finally
+            {
+                cs.Release();
+                CheckPostCall();
+            }
+        }
+
+        public StatusCode SetTriggering(uint subscriptionId, uint triggeringItemId, uint[] linksToAdd, uint[] linksToRemove, out uint[] addResults, out uint[] removeResults)
+        {
+            addResults = null;
+            removeResults = null;
+
+            try
+            {
+                cs.WaitOne();
+                using var sendBuf = new MemoryBuffer(MaximumMessageSize);
+                var headerRes = EncodeMessageHeader(sendBuf, false);
+                if (headerRes != StatusCode.Good) return headerRes;
+
+                var reqHeader = new RequestHeader()
+                {
+                    RequestHandle = nextRequestHandle++,
+                    Timestamp = DateTime.UtcNow,
+                    AuthToken = config.AuthToken,
+                };
+
+                bool succeeded = true;
+                succeeded &= sendBuf.Encode(new NodeId(RequestCode.SetTriggeringRequest));
+                succeeded &= sendBuf.Encode(reqHeader);
+
+                succeeded &= sendBuf.Encode(subscriptionId);
+                succeeded &= sendBuf.Encode(triggeringItemId);
+
+                succeeded &= sendBuf.Encode((UInt32)(linksToAdd?.Length ?? 0));
+                if (linksToAdd != null)
+                    for (int i = 0; i < linksToAdd.Length; i++)
+                        succeeded &= sendBuf.Encode(linksToAdd[i]);
+
+                succeeded &= sendBuf.Encode((UInt32)(linksToRemove?.Length ?? 0));
+                if (linksToRemove != null)
+                    for (int i = 0; i < linksToRemove.Length; i++)
+                        succeeded &= sendBuf.Encode(linksToRemove[i]);
+
+                if (!succeeded) return StatusCode.BadEncodingLimitsExceeded;
+
+                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                var recvEv = new ManualResetEvent(false);
+                lock (recvNotifyLock) { recvNotify[recvKey] = recvEv; }
+
+                var sendRes = MessageSecureAndSend(config, sendBuf);
+                if (sendRes != StatusCode.Good) return sendRes;
+
+                bool signalled = recvEv.WaitOne(Timeout * 1000);
+                lock (recvNotifyLock) { recvNotify.Remove(recvKey); }
+                if (!signalled) return StatusCode.BadRequestTimeout;
+
+                RecvHandler recvHandler = null;
+                lock (recvQueueLock)
+                {
+                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                    recvQueue.Remove(recvKey);
+                }
+
+                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.SetTriggeringResponse))
+                    return CheckServiceFaultResponse(recvHandler);
+
+                if (recvHandler.Header != null && Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
+                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numAdd);
+                addResults = new uint[numAdd];
+                for (int i = 0; i < numAdd; i++)
+                    succeeded &= recvHandler.RecvBuf.Decode(out addResults[i]);
+
+                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRemove);
+                removeResults = new uint[numRemove];
+                for (int i = 0; i < numRemove; i++)
+                    succeeded &= recvHandler.RecvBuf.Decode(out removeResults[i]);
+
+                if (!succeeded) return StatusCode.BadDecodingError;
+                return StatusCode.Good;
+            }
+            finally
+            {
+                cs.Release();
+                CheckPostCall();
+            }
+        }
+
+        public StatusCode Republish(uint subscriptionId, uint retransmitSequenceNumber, out uint notificationSequenceNumber, out DateTimeOffset publishTime)
+        {
+            notificationSequenceNumber = 0;
+            publishTime = DateTimeOffset.MinValue;
+
+            try
+            {
+                cs.WaitOne();
+                using var sendBuf = new MemoryBuffer(MaximumMessageSize);
+                var headerRes = EncodeMessageHeader(sendBuf, false);
+                if (headerRes != StatusCode.Good) return headerRes;
+
+                var reqHeader = new RequestHeader()
+                {
+                    RequestHandle = nextRequestHandle++,
+                    Timestamp = DateTime.UtcNow,
+                    AuthToken = config.AuthToken,
+                };
+
+                bool succeeded = true;
+                succeeded &= sendBuf.Encode(new NodeId(832)); // RepublishRequest
+                succeeded &= sendBuf.Encode(reqHeader);
+                succeeded &= sendBuf.Encode(subscriptionId);
+                succeeded &= sendBuf.Encode(retransmitSequenceNumber);
+
+                if (!succeeded) return StatusCode.BadEncodingLimitsExceeded;
+
+                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                var recvEv = new ManualResetEvent(false);
+                lock (recvNotifyLock) { recvNotify[recvKey] = recvEv; }
+
+                var sendRes = MessageSecureAndSend(config, sendBuf);
+                if (sendRes != StatusCode.Good) return sendRes;
+
+                bool signalled = recvEv.WaitOne(Timeout * 1000);
+                lock (recvNotifyLock) { recvNotify.Remove(recvKey); }
+                if (!signalled) return StatusCode.BadRequestTimeout;
+
+                RecvHandler recvHandler = null;
+                lock (recvQueueLock)
+                {
+                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                    recvQueue.Remove(recvKey);
+                }
+
+                if (!recvHandler.Type.EqualsNumeric(0, 835)) // RepublishResponse
+                    return CheckServiceFaultResponse(recvHandler);
+
+                if (recvHandler.Header != null && Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
+                // NotificationMessage: SequenceNumber + PublishTime + NotificationData[]
+                succeeded &= recvHandler.RecvBuf.Decode(out notificationSequenceNumber);
+                succeeded &= recvHandler.RecvBuf.Decode(out ulong publishTimeTick);
+                try { publishTime = DateTimeOffset.FromFileTime((long)publishTimeTick); } catch { }
+
+                if (!succeeded) return StatusCode.BadDecodingError;
                 return StatusCode.Good;
             }
             finally
@@ -3999,7 +5393,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -4060,6 +5454,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
                 results = new uint[numResults];
                 for (int i = 0; i < numResults; i++)
@@ -4098,7 +5501,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -4161,6 +5564,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
                 results = new MonitoredItemCreateResult[numResults];
                 for (int i = 0; i < numResults; i++)
@@ -4199,7 +5611,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -4262,6 +5674,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
                 results = new MonitoredItemModifyResult[numResults];
                 for (int i = 0; i < numResults; i++)
@@ -4300,7 +5721,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -4361,6 +5782,15 @@ namespace LibUA
                     return CheckServiceFaultResponse(recvHandler);
                 }
 
+                // Check ServiceResult before decoding body
+                if (recvHandler.Header != null &&
+                    Types.StatusCodeIsBad(recvHandler.Header.ServiceResult))
+                {
+                    if (Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+                        return (StatusCode)recvHandler.Header.ServiceResult;
+                    return StatusCode.BadUnexpectedError;
+                }
+
                 succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
                 results = new uint[numResults];
                 for (int i = 0; i < numResults; i++)
@@ -4390,8 +5820,8 @@ namespace LibUA
             succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numSeqNums);
             for (int i = 0; i < numSeqNums; i++) { succeeded &= recvHandler.RecvBuf.Decode(out uint _); }
 
-            succeeded &= recvHandler.RecvBuf.Decode(out bool _);
-            succeeded &= recvHandler.RecvBuf.Decode(out uint _);
+            succeeded &= recvHandler.RecvBuf.Decode(out bool moreNotifications);
+            succeeded &= recvHandler.RecvBuf.Decode(out uint notificationSequenceNumber);
 
             succeeded &= recvHandler.RecvBuf.Decode(out ulong publishTimeTick);
             DateTimeOffset publishTime;
@@ -4399,8 +5829,9 @@ namespace LibUA
             {
                 publishTime = DateTimeOffset.FromFileTime((long)publishTimeTick);
             }
-            catch
+            catch (ArgumentOutOfRangeException)
             {
+                // Invalid file time value — publishTime remains default
             }
 
             succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numNotificationData);
@@ -4472,11 +5903,11 @@ namespace LibUA
                 }
             }
 
-            //results = new uint[numResults];
-            //for (int i = 0; i < numResults; i++)
-            //{
-            //	succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
-            //}
+            // Track acknowledgement for next PublishRequest
+            if (succeeded)
+            {
+                pendingAcknowledgements.Enqueue((subscrId, notificationSequenceNumber));
+            }
         }
 
         public virtual void NotifyEventNotifications(uint subscrId, uint[] clientHandles, object[][] notifications)
@@ -4506,7 +5937,7 @@ namespace LibUA
                 var reqHeader = new RequestHeader()
                 {
                     RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     AuthToken = config.AuthToken,
                 };
 
@@ -4515,7 +5946,14 @@ namespace LibUA
                 succeeded &= sendBuf.Encode(reqHeader);
 
                 // SubscriptionAcknowledgements
-                succeeded &= sendBuf.Encode((UInt32)0);
+                var acks = new List<(uint subId, uint seqNum)>();
+                while (pendingAcknowledgements.TryDequeue(out var ack)) { acks.Add(ack); }
+                succeeded &= sendBuf.Encode((UInt32)acks.Count);
+                foreach (var (subId, seqNum) in acks)
+                {
+                    succeeded &= sendBuf.Encode(subId);
+                    succeeded &= sendBuf.Encode(seqNum);
+                }
 
                 if (!succeeded)
                 {

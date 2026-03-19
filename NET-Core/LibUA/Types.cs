@@ -5993,6 +5993,8 @@ namespace LibUA
             public uint? StatusCode { get; set; }
             public DateTime? SourceTimestamp { get; set; }
             public DateTime? ServerTimestamp { get; set; }
+            public ushort? SourcePicoseconds { get; set; }
+            public ushort? ServerPicoseconds { get; set; }
 
             public DataValue(object Value = null, uint? StatusCode = null, DateTime? SourceTimestamp = null, DateTime? ServerTimestamp = null)
             {
@@ -6018,6 +6020,8 @@ namespace LibUA
                 if (StatusCode != null) { res |= (byte)DataValueSpecifierMask.StatusCodeSpecified; }
                 if (SourceTimestamp != null) { res |= (byte)DataValueSpecifierMask.SourceTimestampSpecified; }
                 if (ServerTimestamp != null) { res |= (byte)DataValueSpecifierMask.ServerTimestampSpecified; }
+                if (SourcePicoseconds != null) { res |= (byte)DataValueSpecifierMask.SourcePicosecondsSpecified; }
+                if (ServerPicoseconds != null) { res |= (byte)DataValueSpecifierMask.ServerPicosecondsSpecified; }
 
                 return res;
             }
@@ -6577,7 +6581,9 @@ namespace LibUA
                 get; protected set;
             }
 
-            public NodeId TargetId
+            public NodeId TargetId => Target?.NodeId;
+
+            public ExpandedNodeId Target
             {
                 get; protected set;
             }
@@ -6597,7 +6603,9 @@ namespace LibUA
                 get; protected set;
             }
 
-            public NodeId TypeDefinition
+            public NodeId TypeDefinition => TypeDefinitionExpanded?.NodeId;
+
+            public ExpandedNodeId TypeDefinitionExpanded
             {
                 get; protected set;
             }
@@ -6606,11 +6614,22 @@ namespace LibUA
             {
                 this.ReferenceTypeId = ReferenceTypeId;
                 this.IsForward = IsForward;
-                this.TargetId = TargetId;
+                this.Target = new ExpandedNodeId(TargetId);
                 this.BrowseName = BrowseName;
                 this.DisplayName = DisplayName;
                 this.NodeClass = NodeClass;
-                this.TypeDefinition = TypeDefinition;
+                this.TypeDefinitionExpanded = new ExpandedNodeId(TypeDefinition);
+            }
+
+            public ReferenceDescription(NodeId ReferenceTypeId, bool IsForward, ExpandedNodeId Target, QualifiedName BrowseName, LocalizedText DisplayName, NodeClass NodeClass, ExpandedNodeId TypeDefinition)
+            {
+                this.ReferenceTypeId = ReferenceTypeId;
+                this.IsForward = IsForward;
+                this.Target = Target;
+                this.BrowseName = BrowseName;
+                this.DisplayName = DisplayName;
+                this.NodeClass = NodeClass;
+                this.TypeDefinitionExpanded = TypeDefinition;
             }
         }
 
@@ -6899,7 +6918,8 @@ namespace LibUA
             public DateTimeOffset Timestamp { get; set; }
             public uint RequestHandle { get; set; }
             public uint ServiceResult { get; set; }
-            public byte ServiceDiagnosticsMask { get; set; }
+            public DiagnosticInfo ServiceDiagnostics { get; set; }
+            public byte ServiceDiagnosticsMask => ServiceDiagnostics?.GetEncodingMask() ?? 0;
             public string[] StringTable { get; set; }
             public ExtensionObject AdditionalHeader { get; set; }
 
@@ -7083,6 +7103,7 @@ namespace LibUA
             public uint ChannelID { get; set; }
             public uint TokenID { get; set; }
             public uint TokenLifetime { get; set; }
+            public uint SessionTimeout { get; set; }
             public DateTimeOffset TokenCreatedAt { get; set; }
 
             public uint? PrevChannelID { get; set; }
@@ -7301,6 +7322,54 @@ namespace LibUA
                 ValueRank = valueRank;
                 ArrayDimensions = arrayDimensions;
                 Description = description;
+            }
+        }
+
+        public class DiagnosticInfo
+        {
+            public int? SymbolicId { get; set; }
+            public int? NamespaceUri { get; set; }
+            public int? LocalizedText { get; set; }
+            public int? Locale { get; set; }
+            public string AdditionalInfo { get; set; }
+            public uint? InnerStatusCode { get; set; }
+            public DiagnosticInfo InnerDiagnosticInfo { get; set; }
+
+            public byte GetEncodingMask()
+            {
+                byte mask = 0;
+                if (SymbolicId.HasValue) mask |= 0x01;
+                if (NamespaceUri.HasValue) mask |= 0x02;
+                if (LocalizedText.HasValue) mask |= 0x04;
+                if (Locale.HasValue) mask |= 0x08;
+                if (AdditionalInfo != null) mask |= 0x10;
+                if (InnerStatusCode.HasValue) mask |= 0x20;
+                if (InnerDiagnosticInfo != null) mask |= 0x40;
+                return mask;
+            }
+        }
+
+        public class ExpandedNodeId
+        {
+            public NodeId NodeId { get; set; }
+            public string NamespaceUri { get; set; }
+            public uint ServerIndex { get; set; }
+
+            public ExpandedNodeId()
+            {
+                NodeId = NodeId.Zero;
+            }
+
+            public ExpandedNodeId(NodeId nodeId)
+            {
+                NodeId = nodeId;
+            }
+
+            public ExpandedNodeId(NodeId nodeId, string namespaceUri, uint serverIndex)
+            {
+                NodeId = nodeId;
+                NamespaceUri = namespaceUri;
+                ServerIndex = serverIndex;
             }
         }
     }
